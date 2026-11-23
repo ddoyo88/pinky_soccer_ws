@@ -1,0 +1,82 @@
+# Bumper v1: U-shaped bumper around the front of the robot, held by two snap hooks on
+# the front standoffs (no screws). Based on the hand sketch on the z = 0 section.
+#
+#   top view (left half)                   x ->
+#        side wall (2 mm, flexes)      front plate
+#     |y| 38.5 ┌──────────────────────┐╲
+#     |y| 36.5 │ ┌────────────────────┘ │   ultrasonic cone holes
+#   hook ( ⬡ )─┘ │ <- step bears on      │
+#      |y| 31.95 └  both plate edges    │
+#             x 16.5  20.5   22.5     37.5 41.5
+#
+# Units: mm. Frame: base_link (x forward, y left, z up); the ground is at z = -28.
+# Robot dimensions below were measured from the official pinky_description meshes
+# (submodule 014a09f). Measure the real robot before printing; plates, standoffs and
+# 3D prints all have tolerances.
+#
+# Measured references
+#   bottom plate      z -19 .. -15 (4 mm), front edge x 20.5, side edge |y| 40
+#   middle plate      z  20 ..  23 (3 mm), front edge x 20.5  -> gap between plates 35 mm
+#   IR sensor board   on the bottom plate, z -15 .. -13.4, |y| <= 30, x 12.5 .. 36.5
+#   ultrasonic        bracket |y| <= 25 (x 14 .. 20.5); cans r 8.5 at y +-11.5, z 9, front x 38.7
+#   front standoffs   hex across flats 4.0 at (16.5, +-36): circumradius 2.30
+#   drive motors      front face x 10.5
+#   wheels            inner face |y| 40.55 for x -28 .. 28
+name: bumper_v1
+
+front_plate:
+  back_x: 37.5        # 1 mm in front of the IR board (36.5)
+  thickness: 4.0
+  half_width: 38.5    # chassis width (plate side edge |y| 40)
+  bottom_z: -19.0     # bottom plate underside -> 9 mm above the ground
+  top_z: 23.0         # middle plate top -> 51 mm above the ground
+  corner_radius: 3.0  # rounded front corners, keep small (nearly square)
+  edge_chamfer: 0.0   # optional final chamfer on sharp edges (e.g. 0.5), applied last;
+                      # 0 keeps the mesh clean (a chamfer adds many tiny faces on curves)
+
+side_walls:           # from the front plate back to the plate edges, along the outside
+  thickness: 2.0      # flexes inwards when the hooks snap over the standoffs
+  step_x: 20.5        # step turning inwards; its back face bears on both plate edges
+  step_length: 2.0    # step spans x 20.5 .. 22.5
+
+hooks:                # one per front standoff (mirrored in y)
+  standoff_x: 16.5
+  standoff_y: 36.0
+  standoff_radius: 2.30     # hex circumradius: the hex orientation on the real robot is unknown
+  radial_clearance: 0.15
+  arm_thickness: 2.0        # same as the side wall
+  hook_thickness: 2.0
+  wrap_deg: 75              # arc behind the standoff from its inner side; 75 keeps the bent
+                            # hook 0.26 mm clear of the IR board edge while snapping on
+  plate_gap_bottom_z: -15.0 # bottom plate top
+  plate_gap_top_z: 20.0     # middle plate bottom
+  height_clearance: 0.4     # total; hook height = 35 - 0.4 (0.2 mm per side)
+  front_wrap_fillet: 2.5    # in front of the standoff the inner face follows the standoff circle,
+                            # then this convex radius blends it into the outer side face (S curve)
+  # the hook tip is a full round (radius = hook_thickness / 2) inside wrap_deg
+
+fillets:              # rounded bends (mm radius) so they do not crack
+  wall_root: 2.0      # side wall into the front plate (inner corner, the flex root)
+  step_inner: 2.5     # front-inner corner of the step     } scaled down together if they do
+  step_wall: 2.5      # step front face into the side wall } not fit the step face (tangent S)
+
+ultrasonic_holes:
+  centers_y: [11.5, -11.5]
+  center_z: 9.0
+  can_radius: 8.5
+  can_front_x: 38.7
+  clearance: 0.5           # radial gap around the can
+  cone_half_angle_deg: 25  # beam is about 15 deg; widen towards the front
+
+material:
+  density_g_cm3: 1.24      # PLA
+  fill_fraction: 0.8       # rough share of solid plastic for thin parts
+  flex_modulus_mpa: 3500   # PLA, for the snap strain/stress estimate
+
+print:
+  orientation: upright     # bottom face down: side walls bend along the filament lines
+
+simulation:
+  # The collision shape is the front plate only (holes ignored); the side walls and hooks
+  # sit beside the robot outline. MuJoCo uses convex hulls, so a single box is exact there.
+  collision: front_plate

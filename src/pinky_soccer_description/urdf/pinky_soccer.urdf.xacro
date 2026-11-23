@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<!--
+  Pinky Pro for the soccer simulation = the OFFICIAL model (pinklab-art/pinky_pro, package pinky_description)
+  + the soccer front bumper (bumper.urdf.xacro / bumper_v1 from cse1598/pinky-soccer, default on)
+  + an optional "dribbler" funnel that keeps the golf ball centred in front of the robot.
+
+  Nothing of the official robot is copied or modified here: dimensions, meshes, sensors (RPLIDAR C1,
+  1280x720 camera, IMU), DiffDrive plugin and frame names (base_footprint, base_link, rplidar_link,
+  front_camera_link ...) all come from pinky_description via insert_robot.
+
+  Args
+    namespace        ""  for the yellow robot, "blue/" for the opponent (same convention as upload_robot.launch.py)
+    is_sim           true -> Gazebo plugins/sensors of pinky_gz.urdf.xacro are added
+    cam_tilt_deg     camera pitch.  Official default is 8; the soccer launch uses 20 so the ball stays visible
+                     when it is only ~9 cm in front of the robot
+    dribbler         true -> funnel plates in front of the nose (3D-print the same shape for the real robot)
+    bumper           true -> U-shaped bumper_v1 on base_link (front plate x 37.5..41.5 mm, z 9..51 mm above ground)
+    bumper_params_file  generated parameter file (cad/bumper/generate_bumper.py), default bumper_v1_params.yaml
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="pinky">
+  <xacro:include filename="$(find pinky_description)/urdf/pinky.urdf.xacro"/>
+  <xacro:include filename="$(find pinky_soccer_description)/urdf/bumper.urdf.xacro"/>
+
+  <xacro:arg name="namespace" default=""/>
+  <xacro:arg name="is_sim" default="false"/>
+  <xacro:arg name="cam_tilt_deg" default="20"/>
+  <xacro:arg name="screen_tilt_deg" default="-25"/>
+  <xacro:arg name="dribbler" default="false"/>
+  <xacro:arg name="bumper" default="true"/>
+  <xacro:arg name="bumper_params_file"
+             default="$(find pinky_soccer_description)/config/bumper_v1_params.yaml"/>
+
+  <xacro:insert_robot namespace="$(arg namespace)"
+                      is_sim="$(arg is_sim)"
+                      cam_tilt_deg="$(arg cam_tilt_deg)"
+                      screen_tilt_deg="$(arg screen_tilt_deg)"/>
+
+  <xacro:if value="$(arg bumper)">
+    <xacro:insert_bumper namespace="$(arg namespace)" params_file="$(arg bumper_params_file)"/>
+  </xacro:if>
+
+  <!-- ===== dribbler funnel (soccer add-on) =====
+       Body front is at x = +0.039 m (collision mesh bounds of base_link.stl).  Two plates open forward:
+       at the mouth the opening is ~0.10 m wide, a 42.7 mm golf ball settles where the gap equals its diameter
+       (ball centre ~0.07 m ahead of base_footprint).  The plates are only 3.3 cm high, far below the lidar
+       plane (12.5 cm), so they never appear in the scan.  base_link origin is 0.028 m above the floor. -->
+  <xacro:property name="ns" value="$(arg namespace)"/>
+  <xacro:if value="$(arg dribbler)">
+    <xacro:macro name="funnel_plate" params="side sy">
+      <link name="funnel_${side}">
+        <visual>
+          <geometry><box size="0.055 0.004 0.03"/></geometry>
+          <material name="funnel_mat"><color rgba="0.95 0.75 0.10 1.0"/></material>
+        </visual>
+        <collision>
+          <geometry><box size="0.055 0.004 0.03"/></geometry>
+        </collision>
+        <inertial>
+          <mass value="0.005"/>
+          <inertia ixx="1e-7" ixy="0" ixz="0" iyy="1e-7" iyz="0" izz="1e-7"/>
+        </inertial>
+      </link>
+      <joint name="${ns}funnel_${side}_fixed_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="funnel_${side}"/>
+        <origin xyz="0.065 ${sy*0.031} -0.010" rpy="0 0 ${sy*0.759}"/>
+      </joint>
+      <gazebo reference="funnel_${side}">
+        <mu1>0.05</mu1>
+        <mu2>0.05</mu2>
+      </gazebo>
+    </xacro:macro>
+    <xacro:funnel_plate side="l" sy="1"/>
+    <xacro:funnel_plate side="r" sy="-1"/>
+  </xacro:if>
+</robot>

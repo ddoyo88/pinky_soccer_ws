@@ -1,0 +1,20 @@
+# Opponent (blue) = the same official Pinky model spawned with namespace "blue/" (topics blue/cmd_vel, blue/odom).
+# Its sensors are stripped (it is only a body driven by opponent_bot).  Its odom TF goes out on the global
+# /tf as blue/odom -> blue/base_footprint, which never collides with the yellow robot's frames.
+- ros_topic_name: "blue/cmd_vel"
+  gz_topic_name: "blue/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "gz.msgs.Twist"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "blue/odom"
+  gz_topic_name: "blue/odom"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "gz.msgs.Odometry"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/gz/dynamic_pose"
+  gz_topic_name: "/model/pinky_blue/pose"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "gz.msgs.Pose_V"
+  direction: GZ_TO_ROS

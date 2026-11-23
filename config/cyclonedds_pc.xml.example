@@ -1,0 +1,17 @@
+<!-- ON THE PC: ~/cyclonedds_pc.xml (used by real_duel / camera_calib.sh).
+     NetworkInterface: the PC's Wi-Fi interface (ip -4 addr).  Peers: both robots' addresses (shown on their LCD). -->
+<CycloneDDS><Domain>
+  <General>
+    <Interfaces><NetworkInterface name="wlp0s20f3"/></Interfaces>
+    <AllowMulticast>false</AllowMulticast>
+  </General>
+  <Discovery>
+    <ParticipantIndex>auto</ParticipantIndex>
+    <MaxAutoParticipantIndex>100</MaxAutoParticipantIndex>
+    <Peers>
+      <Peer Address="localhost"/>
+      <Peer Address="YELLOW_ROBOT_IP"/>   <!-- yellow robot, domain 37 -->
+      <Peer Address="BLUE_ROBOT_IP"/>     <!-- blue robot, domain 38 -->
+    </Peers>
+  </Discovery>
+</Domain></CycloneDDS>

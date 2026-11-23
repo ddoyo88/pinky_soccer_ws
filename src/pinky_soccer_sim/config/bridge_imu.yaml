@@ -1,0 +1,6 @@
+# Yellow robot IMU (official sensor, gz topic imu_raw, frame imu_link) -> /imu for the EKF (ekf_yellow.yaml).
+- ros_topic_name: "imu"
+  gz_topic_name: "imu_raw"
+  ros_type_name: "sensor_msgs/msg/Imu"
+  gz_type_name: "gz.msgs.IMU"
+  direction: GZ_TO_ROS

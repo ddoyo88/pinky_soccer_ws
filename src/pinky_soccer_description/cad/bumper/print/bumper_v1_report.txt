@@ -1,0 +1,25 @@
+bumper_v1
+faces 3096, watertight True, bodies 1, edges < 0.05 mm 40, slivers 112
+step fillets scaled to 2.47 / 2.47 mm to fit the 4.95 mm step face
+volume 15.96 cm^3 -> mass 15.8 g (density 1.24 x fill 0.8)
+bounds base_link mm x[12.56,41.50] y[-38.50,38.50] z[-19.00,23.00]
+ground clearance 9.00 mm, top 51.00 mm above ground
+centre of mass base_link mm [34.33, 0.0, 1.07]
+inertia about COM kg m^2 ixx 1.512e-05, iyy 3.458e-06, izz 1.377e-05, ixy -2.617e-11, ixz 9.643e-08, iyz 5.305e-12
+snap: hook tip flexes 1.30 mm; side wall root strain 0.91 % (~32 MPa); PLA snap fits are usually kept below ~2 %
+
+clearance check against pinky_description visual meshes
+robot surface points sampled: 987292
+fitted: robot points inside the bumper (> 0.05 mm): 0
+snapping (bent side wall, 0.1 mm steps): max hook tip flex 1.30 mm; robot parts hit on the way: 0
+within 0.3 mm of the fitted bumper:
+    base_link/ID180-mesh: 723 pts x[12.7,20.5] |y|[31.3,37.2] z[-19.0,23.0]
+    base_link/ID180-mesh_1: 178 pts x[15.2,15.7] |y|[34.0,34.3] z[-14.9,20.0]
+    base_link/ID180-mesh_6: 5 pts x[38.7,38.7] |y|[10.1,19.3] z[1.1,7.1]
+within 1.0 mm of the fitted bumper:
+    base_link/ID180-mesh: 1097 pts x[12.1,20.5] |y|[30.6,37.4] z[-19.0,23.0]
+    base_link/ID180-mesh_1: 1171 pts x[14.8,18.0] |y|[34.0,35.2] z[-15.8,20.7]
+    base_link/ID180-mesh_5: 1056 pts x[38.2,38.2] |y|[5.1,17.9] z[2.6,15.4]
+    base_link/ID180-mesh_6: 1754 pts x[36.5,38.7] |y|[3.0,20.0] z[0.5,17.5]
+
+print (upright) size mm: [28.9, 77.0, 42.0]

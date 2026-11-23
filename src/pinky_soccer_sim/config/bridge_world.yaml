@@ -1,0 +1,15 @@
+# Ground-truth poses of the moving models (referee, scripted opponent, gt ball backend, dataset auto-labelling).
+# Each model carries a PosePublisher system that publishes its own world pose with child_frame_id = model name
+# (pinky_yellow, golf_ball; pinky_blue in bridge_blue.yaml).  The world-level /world/soccer/dynamic_pose/info is
+# NOT used: ros_gz_bridge's Pose_V -> TFMessage conversion drops the model names there (empty child_frame_id).
+- ros_topic_name: "/gz/dynamic_pose"
+  gz_topic_name: "/model/golf_ball/pose"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "gz.msgs.Pose_V"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/gz/dynamic_pose"
+  gz_topic_name: "/model/pinky_yellow/pose"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "gz.msgs.Pose_V"
+  direction: GZ_TO_ROS

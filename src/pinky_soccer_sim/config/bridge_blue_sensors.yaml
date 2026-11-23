@@ -1,0 +1,14 @@
+# Blue robot sensors (only used by the sensor view; the scripted opponent drives from ground truth).
+# Frames are blue/rplidar_link and blue/front_camera_link (robot_state_publisher frame_prefix "blue/").
+# The image itself goes through a second ros_gz_image image_bridge (/blue/camera/image_raw).
+- ros_topic_name: "blue/scan"
+  gz_topic_name: "blue/scan"
+  ros_type_name: "sensor_msgs/msg/LaserScan"
+  gz_type_name: "gz.msgs.LaserScan"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "blue/camera/camera_info"
+  gz_topic_name: "blue/camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS

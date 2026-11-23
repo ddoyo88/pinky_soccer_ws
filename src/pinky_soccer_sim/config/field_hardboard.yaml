@@ -1,0 +1,28 @@
+# Custom field: four 610 x 910 mm boards in a 2 x 2 arrangement.
+# SI units. Interior wall-to-wall floor is exactly 1.820 x 1.220 m.
+# Markings are a rounded ~2/3 RCJ-inspired training design, NOT an official RCJ size.
+source: User-defined four-board training field, 2026-11-21
+specification_date: '2026-11-21'
+field_id: hardboard
+playing_length: 1.660
+playing_width: 1.060
+outer_strip: 0.080
+wall_height: 0.200 # User clarified 20 cm, not 20 mm.
+goal_width: 0.400
+goal_height: 0.070 # Opening height: golf-ball clearance; independent of outer walls.
+goal_depth: 0.050
+ramp_base: 0.0 # Flat hardboard; no RCJ corner wedges assumed.
+ramp_rise: 0.0
+line_width: 0.015
+penalty_depth: 0.170
+penalty_width: 0.540
+penalty_radius: 0.100
+center_diameter: 0.400
+neutral_diameter: 0.007
+neutral_distance_from_end: 0.300
+# Simulation construction assumptions, NOT measured board thickness/material properties.
+wall_thickness: 0.010
+floor_thickness: 0.020
+thin_black_line: 0.002
+friction: 0.8
+arc_segments: 128

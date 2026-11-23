@@ -1,0 +1,24 @@
+# colcon build output (rebuilt with colcon build)
+build/
+install/
+log/
+
+# official Pinky Pro packages: re-cloned (pinned commit) by scripts/setup_workspace.sh
+src/pinky_pro/
+
+# Python / editor
+__pycache__/
+*.pyc
+.vscode/
+
+# large / generated
+*.pt
+*.onnx
+runs/
+
+# player photos for the LCD celebration (copyright): add your own with these names
+src/pinky_soccer_sim/media/son.png
+src/pinky_soccer_sim/media/ronaldo.png
+
+# local notes with this site's network details
+메뉴얼

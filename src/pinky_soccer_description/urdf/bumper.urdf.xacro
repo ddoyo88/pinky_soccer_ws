@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <!--
+    Front bumper attached to base_link with a fixed joint.
+
+    Values come from params_file (default config/bumper_v1_params.yaml). Each dimension
+    argument overrides the file when it is not an empty string.
+
+    Naming follows pinky_description/urdf/pinky.urdf.xacro: link names carry no
+    namespace prefix (robot_state_publisher's frame_prefix adds it), joint names do.
+    -->
+    <xacro:macro name="insert_bumper"
+                 params="namespace params_file
+                         width:='' depth:='' height:=''
+                         offset_x:='' offset_y:='' offset_z:='' mass:=''">
+
+        <xacro:property name="_cfg" value="${xacro.load_yaml(params_file)['bumper']}"/>
+
+        <xacro:property name="_w" value="${float(width) if str(width) != '' else float(_cfg['width'])}"/>
+        <xacro:property name="_d" value="${float(depth) if str(depth) != '' else float(_cfg['depth'])}"/>
+        <xacro:property name="_h" value="${float(height) if str(height) != '' else float(_cfg['height'])}"/>
+        <xacro:property name="_x" value="${float(offset_x) if str(offset_x) != '' else float(_cfg['offset_x'])}"/>
+        <xacro:property name="_y" value="${float(offset_y) if str(offset_y) != '' else float(_cfg['offset_y'])}"/>
+        <xacro:property name="_z" value="${float(offset_z) if str(offset_z) != '' else float(_cfg['offset_z'])}"/>
+        <xacro:property name="_m" value="${float(mass) if str(mass) != '' else float(_cfg['mass'])}"/>
+
+        <xacro:property name="_visual_mesh" value="${str(_cfg.get('visual_mesh', '') or '')}"/>
+        <xacro:property name="_collision_mesh" value="${str(_cfg.get('collision_mesh', '') or '')}"/>
+        <xacro:property name="_scale" value="${' '.join(str(float(s)) for s in _cfg.get('mesh_scale', [1, 1, 1]))}"/>
+        <xacro:property name="_rgba" value="${' '.join(str(float(c)) for c in _cfg.get('color', [0.1, 0.45, 0.9, 1.0]))}"/>
+
+        <xacro:if value="${_w &lt;= 0 or _d &lt;= 0 or _h &lt;= 0}">
+            ${xacro.fatal('bumper width/depth/height must be > 0 (got %g, %g, %g)' % (_w, _d, _h))}
+        </xacro:if>
+        <xacro:if value="${_m &lt;= 0}">
+            ${xacro.fatal('bumper mass must be > 0 (got %g)' % _m)}
+        </xacro:if>
+
+        <link name="bumper_link">
+            <visual>
+                <origin xyz="0 0 0" rpy="0 0 0"/>
+                <geometry>
+                    <xacro:if value="${_visual_mesh != ''}">
+                        <mesh filename="${_visual_mesh}" scale="${_scale}"/>
+                    </xacro:if>
+                    <xacro:unless value="${_visual_mesh != ''}">
+                        <box size="${_d} ${_w} ${_h}"/>
+                    </xacro:unless>
+                </geometry>
+                <material name="bumper_material">
+                    <color rgba="${_rgba}"/>
+                </material>
+            </visual>
+            <collision>
+                <origin xyz="0 0 0" rpy="0 0 0"/>
+                <geometry>
+                    <xacro:if value="${_collision_mesh != ''}">
+                        <mesh filename="${_collision_mesh}" scale="${_scale}"/>
+                    </xacro:if>
+                    <xacro:unless value="${_collision_mesh != ''}">
+                        <box size="${_d} ${_w} ${_h}"/>
+                    </xacro:unless>
+                </geometry>
+            </collision>
+            <!--
+            Inertia about bumper_link (rpy must stay 0: pinky_mujoco rejects rotated inertias).
+            Uses params_file 'inertia' when given (computed from the CAD mesh by
+            cad/bumper/generate_bumper.py), otherwise a solid box of width/depth/height.
+            -->
+            <inertial>
+                <origin xyz="0 0 0" rpy="0 0 0"/>
+                <mass value="${_m}"/>
+                <xacro:if value="${'inertia' in _cfg and str(mass) == ''}">
+                    <xacro:property name="_i" value="${_cfg['inertia']}"/>
+                    <inertia ixx="${_i['ixx']}" ixy="${_i.get('ixy', 0)}" ixz="${_i.get('ixz', 0)}"
+                             iyy="${_i['iyy']}" iyz="${_i.get('iyz', 0)}"
+                             izz="${_i['izz']}"/>
+                </xacro:if>
+                <xacro:unless value="${'inertia' in _cfg and str(mass) == ''}">
+                    <inertia ixx="${_m * (_w * _w + _h * _h) / 12}" ixy="0" ixz="0"
+                             iyy="${_m * (_d * _d + _h * _h) / 12}" iyz="0"
+                             izz="${_m * (_d * _d + _w * _w) / 12}"/>
+                </xacro:unless>
+            </inertial>
+        </link>
+
+        <joint name="${namespace}bumper_joint" type="fixed">
+            <parent link="base_link"/>
+            <child link="bumper_link"/>
+            <origin xyz="${_x} ${_y} ${_z}" rpy="0 0 0"/>
+        </joint>
+    </xacro:macro>
+</robot>
