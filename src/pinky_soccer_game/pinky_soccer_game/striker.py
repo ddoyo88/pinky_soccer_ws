@@ -105,6 +105,8 @@ class Striker(Node):
                                            # in front of our goal where the scorer is
         P('concede_hold', 1.5)             # [s] wait at the centre-line point before going back
         P('scorer_delay', 3.0)             # [s] after a restart the team that scored last waits this long
+        P('first_kick', 'yellow')          # the match's first kickoff: this team goes, the other waits
+                                           # scorer_delay (the same 3 s head start)
         P('celebrate_w', 3.0)              # [rad/s] spin speed (real wheels allow ~5.9)
         P('use_opponent', True)            # False: no opponent on the field (real single-robot run) -> lidar
                                            # points that do not match the map are NOT dodged
@@ -114,7 +116,11 @@ class Striker(Node):
         P('outer_strip', FIELD_STRIP)      # field edge -> wall distance (detour points may use it)
         P('policy_path', '')               # RL policy (.npz from pinky_soccer_rl.export): plays the PLAY phase
                                            # instead of the rule-based state machine; '' = rules
+        P('rl_search_after', 3.0)          # [s] RL mode: ball unseen this long -> the rule-based search (back up,
+                                           # turn, roam) until the camera sees it again, then the policy again
         P('line_guard', True)              # never drive over the white boundary line (camera, line/boundary)
+        P('robot_guard', True)             # never drive into the other robot (lidar): slow from 0.32 m centre
+                                           # distance, stop at 0.20 m - same rule as the RL training
         P('robot_front', 0.05)             # [m] base_footprint -> bumper front
         P('robot_back', 0.08)              # [m] base_footprint -> rear
         P('robot_half_width', 0.065)       # [m]
@@ -155,6 +161,7 @@ class Striker(Node):
         self.kickoff = 'OPEN'
         self.concede_xy, self.concede_t0, self.concede_hold_t = None, 0.0, None
         self.scored_last, self.hold_until = False, 0.0
+        self.first_kickoff = True
         self.stuck_ref = None
         self.backoff_until = 0.0
         self.jam_count, self.jam_last_t, self.escape_until = 0, 0.0, 0.0
@@ -183,7 +190,7 @@ class Striker(Node):
             self.create_subscription(String, '/game/goal', self._goal_scored, 10)
 
         self.cmd_pub = GuardedPublisher(self.create_publisher(Twist, self.get_parameter('cmd_topic').value, 10),
-                                        self._line_guard)
+                                        lambda c: self._robot_guard(self._line_guard(c)))
         self.line_pts, self.line_t, self.line_stops = np.zeros((0, 2)), 0.0, 0
         self.create_subscription(PoseArray, 'line/boundary', self._line, 10)
         self.rl, self.rl_t, self.rl_cmd = None, 0.0, (0.0, 0.0)
@@ -237,9 +244,12 @@ class Striker(Node):
             if self.rl is not None:
                 self.rl.reset()
             self.concede_xy = None
-            if self.scored_last:          # we scored the last goal: the other team gets a head start
+            first = self.first_kickoff and \
+                self.get_parameter('team').value.lower() != self.get_parameter('first_kick').value.lower()
+            if self.scored_last or first:     # we scored the last goal / not our first kickoff: head start
                 self.hold_until = time.time() + self.get_parameter('scorer_delay').value
             self.scored_last = False
+            self.first_kickoff = False
             self.t_start = time.time() - self.get_parameter('start_delay').value
             self.cancel_nav()
             self.get_logger().info('match started')
@@ -251,6 +261,7 @@ class Striker(Node):
         elif msg.data == 'WAIT':
             self.celebrating = False
             self.concede_xy, self.scored_last, self.hold_until = None, False, 0.0
+            self.first_kickoff = True                 # next START is a new match's first kickoff
             self.match_phase = 'WAIT'
             self.cancel_nav()
 
@@ -292,6 +303,15 @@ class Striker(Node):
 
     def _rl_play(self, pose, now):
         """PLAY with the learned policy: a new action every 0.1 s (the training rate), repeated in between."""
+        unseen = (now - self.ball_t) if self.ball is not None else 1e9
+        if unseen > self.get_parameter('rl_search_after').value:
+            # safety net for the game flow: the policy does not find the ball -> the proven search routine
+            self.cancel_nav()
+            self.play_ctx = (pose, self.estimate_opponent(pose), None)
+            self.search(pose[0], pose[1], pose[2], now)
+            self.rl_t = 0.0                                  # fresh policy step as soon as the ball is back
+            return
+        self.search_phase = None
         if now - self.rl_t >= 0.095:
             seen = self.ball is not None and now - self.ball_t < 0.25
             since = (now - self.ball_t) if self.ball is not None else 5.0
@@ -323,6 +343,34 @@ class Striker(Node):
     def _line(self, m):
         self.line_pts = np.array([[q.position.x, q.position.y] for q in m.poses]).reshape(-1, 2)
         self.line_t = time.time()
+
+    def _robot_guard(self, cmd):
+        """No collisions: the other robot (lidar estimate, fresh) in the way -> slow down / stop that motion."""
+        if not self.get_parameter('robot_guard').value or self.opp is None or time.time() - self.opp_t > 0.6:
+            return cmd
+        pose = self.robot_pose()
+        if pose is None:
+            return cmd
+        rx, ry, ryaw = pose
+        dx, dy = self.opp[0] - rx, self.opp[1] - ry
+        c, s = math.cos(ryaw), math.sin(ryaw)
+        from pinky_soccer_game.rl_policy import has_priority, robot_guard
+        # right of way: the robot closer to the ball (camera ball, lidar opponent) goes first; tie -> yellow
+        ball = self.ball if (self.ball is not None and time.time() - self.ball_t < 1.0) else None
+        prio = has_priority((rx, ry), self.opp, ball, self.get_parameter('team').value == 'yellow',
+                            had=getattr(self, 'had_priority', None) if ball is not None else None)
+        if prio != getattr(self, 'had_priority', None):
+            self.had_priority = prio
+            if ball is not None:
+                self.get_logger().info('right of way at the ball: ' + ('mine - going in' if prio else
+                                                                     'the other robot is closer - giving way'))
+        v = robot_guard(cmd.linear.x, (c * dx + s * dy, -s * dx + c * dy), prio)
+        if v != cmd.linear.x:
+            self.robot_stops = getattr(self, 'robot_stops', 0) + 1
+            if v == 0.0 and self.robot_stops % 20 == 1:
+                self.get_logger().info(f'other robot {math.hypot(dx, dy):.2f} m in the way: stop')
+        cmd.linear.x = v
+        return cmd
 
     def _line_guard(self, cmd):
         """Boundary points (base frame, from the camera) inside the strip the robot would sweep next -> no

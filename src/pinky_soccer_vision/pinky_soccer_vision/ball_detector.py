@@ -220,7 +220,7 @@ class BallDetector(Node):
         if self.K is None:
             self._fallback_K(rgb)
         if self.get_parameter('detect_lines').value:
-            self._lines(rgb, msg.header.frame_id)
+            self._lines(rgb, msg.header.frame_id, msg.header.stamp)
         cands = self._detect_yolo(rgb) if self.backend == 'yolo' else self._detect_hsv(rgb)
         det = None
         for c in cands[:5]:
@@ -282,9 +282,8 @@ class BallDetector(Node):
         pb.point.x, pb.point.y, pb.point.z = float(p[0]), float(p[1]), float(p[2])
         self.pub_base.publish(pb)
 
-        try:
-            t_mb = self.tf_buffer.lookup_transform('map', self.base_frame, rclpy.time.Time())
-        except tf2_ros.TransformException:
+        t_mb = self._tf_at('map', stamp)
+        if t_mb is None:
             return True
         yaw = yaw_from_quat(t_mb.transform.rotation)
         tx, ty = t_mb.transform.translation.x, t_mb.transform.translation.y
@@ -296,8 +295,21 @@ class BallDetector(Node):
         self.pub_map.publish(pm)
         return True
 
+    def _tf_at(self, target, stamp):
+        """target <- base at the IMAGE time (the robot may have turned ~0.3 rad in the ~0.1 s between the photo and
+        now: a 1 m ball would land ~30 cm off); the latest transform if that time is not available (e.g. the
+        robot's and the PC's clocks are not synchronised)."""
+        try:
+            return self.tf_buffer.lookup_transform(target, self.base_frame, rclpy.time.Time.from_msg(stamp))
+        except (tf2_ros.TransformException, TypeError, ValueError):
+            pass
+        try:
+            return self.tf_buffer.lookup_transform(target, self.base_frame, rclpy.time.Time())
+        except tf2_ros.TransformException:
+            return None
+
     # ----------------------------------------------------------------- field lines
-    def _lines(self, rgb, cam_frame):
+    def _lines(self, rgb, cam_frame, stamp=None):
         import cv2
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         h, w = rgb.shape[:2]
@@ -324,10 +336,7 @@ class BallDetector(Node):
             p = o[None, :2] + sc[:, None] * d[:, :2]
             ok = down & (sc > 0) & (np.hypot(p[:, 0], p[:, 1]) < g('line_range'))
             p, uv = p[ok], uv[ok]
-            try:
-                t_mb = self.tf_buffer.lookup_transform('map', self.base_frame, rclpy.time.Time())
-            except tf2_ros.TransformException:
-                t_mb = None
+            t_mb = self._tf_at('map', stamp) if stamp is not None else None
             if t_mb is not None and len(p):
                 yaw = yaw_from_quat(t_mb.transform.rotation)
                 c, s = math.cos(yaw), math.sin(yaw)
@@ -340,11 +349,13 @@ class BallDetector(Node):
                 side = W2 - np.abs(my) < band
                 isb = inside & (end | side)
                 boundary_px, other_px = uv[isb], uv[~isb]
-                # remember the boundary points in odom (robot-fixed memory survives the blind spot)
-                yo = yaw_from_quat(t_ob.transform.rotation)
+                # remember the boundary points in odom (robot-fixed memory survives the blind spot) - placed with
+                # the pose at the image time, re-published below with the pose now
+                t_img = (self._tf_at('odom', stamp) if stamp is not None else None) or t_ob
+                yo = yaw_from_quat(t_img.transform.rotation)
                 co, so = math.cos(yo), math.sin(yo)
-                ox = t_ob.transform.translation.x + co * p[isb, 0] - so * p[isb, 1]
-                oy = t_ob.transform.translation.y + so * p[isb, 0] + co * p[isb, 1]
+                ox = t_img.transform.translation.x + co * p[isb, 0] - so * p[isb, 1]
+                oy = t_img.transform.translation.y + so * p[isb, 0] + co * p[isb, 1]
                 for x, y in zip(ox, oy):
                     self.line_mem[(int(round(x / 0.02)), int(round(y / 0.02)))] = (x, y, tnow)
         self.line_px = (boundary_px, other_px)

@@ -373,8 +373,8 @@ class RealReferee(Node):
                 self.ball_at_mouth_t = None
                 self.corner_since = None
                 self._set_phase('START')
-                self._event('경기 시작 - 가운데 공, 동시 출발 (직전 득점 팀은 3초 뒤)' if self.goals else
-                            '경기 시작 - 가운데 공, 동시 출발')
+                self._event('경기 시작 - 가운데 공 (직전 득점 팀은 3초 뒤 출발)' if self.goals else
+                            '경기 시작 - 가운데 공, 노랑 선공 (파랑은 3초 뒤 출발)')
             elif ready and not centred and still and self.asked_ball != 'off_centre':
                 self.asked_ball = 'off_centre'
                 self._event(f'공이 가운데가 아닙니다 ({b[0]:.2f}, {b[1]:.2f}) - 가운데에 놓으면 자동 시작 '

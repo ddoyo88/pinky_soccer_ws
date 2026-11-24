@@ -6,6 +6,7 @@
                  (use ~/pinky_rl/stage1/latest - saved at every evaluation)
 """
 import argparse
+import os
 import math
 import time
 
@@ -36,9 +37,13 @@ def main():
     ap.add_argument('--scripted', action='store_true')
     ap.add_argument('--speed', type=float, default=1.0, help='playback speed (2 = twice real time)')
     ap.add_argument('--follow', action='store_true')
+    ap.add_argument('--fallback', default='', help='--follow: play this policy until <policy> is first saved')
+    ap.add_argument('--opponent_policy', default='~/pinky_rl/policy_stage2.npz',
+                    help='stage 3: the self-play opponent shown in half of the opponent episodes')
     a = ap.parse_args()
     env = PinkySoccerEnv(stage=a.stage, render_mode='human')
-    import os
+    if a.stage >= 3:
+        env.load_opponent(os.path.expanduser(a.opponent_policy))
     import pickle
     model = vn = None
     loaded = 0.0
@@ -48,17 +53,21 @@ def main():
     def load():
         nonlocal model, vn, loaded, label
         from stable_baselines3 import PPO
-        if not os.path.exists(a.policy + '.zip'):
+        src = a.policy
+        if not os.path.exists(src + '.zip'):
             if not a.follow:
-                raise SystemExit(f'{a.policy}.zip not found')
-            return                                            # --follow: random actions until it exists
+                raise SystemExit(f'{src}.zip not found')
+            if not a.fallback or model is not None:
+                return                                        # --follow: keep playing until it exists
+            src = os.path.expanduser(a.fallback)
         time.sleep(1.0)                                       # let the trainer finish writing
-        model = PPO.load(a.policy + '.zip', device='cpu')
-        with open(a.policy + '_vecnorm.pkl', 'rb') as f:
+        model = PPO.load(src + '.zip', device='cpu')
+        with open(src + '_vecnorm.pkl', 'rb') as f:
             vn = pickle.load(f)
-        loaded = os.path.getmtime(a.policy + '.zip')
-        info = a.policy + '.txt'
-        label = open(info).read().strip() if os.path.exists(info) else os.path.basename(a.policy)
+        loaded = os.path.getmtime(src + '.zip') if src == a.policy else 0.0
+        info = src + '.txt'
+        label = open(info).read().strip() if (src == a.policy and os.path.exists(info)) else \
+            f'{os.path.basename(os.path.dirname(src))}/{os.path.basename(src)} (until the new one is saved)'
         print('policy loaded: ' + label, flush=True)
     if not a.scripted:
         load()

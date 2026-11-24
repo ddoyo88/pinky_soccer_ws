@@ -106,8 +106,13 @@ pinky_soccer_ws/
 | OUT, NO_ROOM | 공이 골라인 밖 / 공 뒤로 갈 자리가 없음 (대기) |
 | BACKOFF, ESCAPE | 막힘 → 물러나기, 반복해서 막히면 중앙 쪽으로 빠져나오기 |
 | RL_PLAY | 강화학습 정책이 경기 중 판단을 맡는 중 (`policy_path` 설정 시) |
+| RL_ESCAPE | RL 모드에서 라인 가드에 1.5초 넘게 막힘 → 1초 동안 경기장 중앙 쪽으로 |
 
-- **안전장치:** 모든 속도 명령은 `GuardedPublisher`를 거쳐 흰 바깥 라인 쪽 이동을 막습니다(`_line_guard`). 직접 제어 명령은 상대 회피 필터(`avoidance.avoid_opponent`)와 골문 진입 방지(`goal_mouth_guard`)도 거칩니다.
+- **안전장치:** 모든 속도 명령은 `GuardedPublisher`를 거쳐 두 가지 검사를 받습니다.
+  - **라인 가드**(`_line_guard`): 흰 바깥 라인 쪽 이동을 막습니다.
+  - **로봇 가드**(`_robot_guard`, `rl_policy.robot_guard`): 상대 로봇 쪽 이동을 32 cm부터 줄이고 20 cm에서 멈춥니다.
+    - 공에 더 가까운 로봇은 우선권을 갖고 17 cm까지 갈 수 있고, 양보하는 로봇은 24 cm에서 멈춥니다.
+    - 우선권은 `rl_policy.has_priority`로 정하고, 한 번 정해지면 6 cm 차이가 나기 전까지 바뀌지 않습니다. 직접 제어 명령은 상대 회피 필터(`avoidance.avoid_opponent`)와 골문 진입 방지(`goal_mouth_guard`)도 거칩니다.
 - **주요 설정값:**
 
 | 분류 | 설정값 |
@@ -116,7 +121,9 @@ pinky_soccer_ws/
 | 공 뒤로 돌기 | `orbit_radius`, `behind_dist` |
 | 슛 조건 | `shoot_range`, `shoot_lat`, `shoot_heading` |
 | 세레모니 | `celebrate_turns` (3) |
-| 경기 규칙 | `scorer_delay` (3초), `concede_centre`, `concede_hold` |
+| 경기 규칙 | `scorer_delay` (3초), `first_kick` (첫 출발 팀, 기본 노랑), `concede_centre`, `concede_hold` |
+| 강화학습 | `policy_path` (정책 파일), `rl_search_after` (공을 이 시간 못 보면 규칙 기반 공 찾기, 3초) |
+| 안전 | `robot_guard` (로봇 가드 켜기) |
 | 막힘 처리 | `stuck_time`, `jam_dist`, `backoff_dist` |
 | 라인 가드 | `line_guard`, `robot_front`, `robot_back`, `robot_half_width`, `line_margin` |
 

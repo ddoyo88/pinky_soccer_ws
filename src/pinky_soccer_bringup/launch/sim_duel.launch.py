@@ -95,8 +95,7 @@ def _robot(context, team, domain, gz_prefix, pose, L, W, G, strip, v, sim='gz'):
                     # avoid_opponent (default): the other robot nearby is an obstacle to go round
                     'use_opponent': v('avoid_opponent').lower() == 'true',
                     'orbit_radius': 0.24,                    # tighter loop round the ball: back on it sooner
-                    'search_w': 1.2,                         # sim: look around faster (real robot keeps 0.6)
-                    'v_dribble': min(0.22, float(v('max_speed')))})
+                    'search_w': float(v('search_w')), 'w_max': float(v('turn_max'))})
     ns = team
     actions = [
         SetEnvironmentVariable('ROS_DOMAIN_ID', str(domain)),
@@ -212,6 +211,8 @@ def generate_launch_description():
                               description="start pose from the own goal line [m]; 'line' = on the penalty line"),
         DeclareLaunchArgument('cam_tilt_deg', default_value='20'),
         DeclareLaunchArgument('win_score', default_value='5'),
+        DeclareLaunchArgument('turn_max', default_value='2.0', description='rad/s max turn rate (rule-based striker)'),
+        DeclareLaunchArgument('search_w', default_value='1.5', description='rad/s spin while looking for the ball'),
         DeclareLaunchArgument('policy_yellow', default_value='',
                               description='RL policy .npz (pinky_soccer_rl.export) for yellow; empty = rules'),
         DeclareLaunchArgument('policy_blue', default_value='',

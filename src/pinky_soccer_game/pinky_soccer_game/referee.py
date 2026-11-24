@@ -273,7 +273,12 @@ class Referee(Node):
         self.last_move_t = time.time()
         self.cooldown_until = time.time() + 0.5
         self._set_phase('START')
-        self._event('경기 시작 - 가운데 공, 동시 출발' if self.kickoff == 'OPEN' else f'경기 시작 - {self.kickoff} 킥오프')
+        if self.kickoff != 'OPEN':
+            self._event(f'경기 시작 - {self.kickoff} 킥오프')
+        elif not self.goals:
+            self._event('경기 시작 - 가운데 공, 노랑 선공 (파랑은 3초 뒤 출발)')
+        else:
+            self._event('경기 시작 - 가운데 공 (직전 득점 팀은 3초 뒤 출발)')
 
     def _goal(self, team, now):
         """Counted automatically; the conceding team kicks off from the centre spot."""
