@@ -64,8 +64,11 @@ def quat_yaw(q):
 
 
 # ------------------------------------------------------------------------------------------------ model
-def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.0003):
-    """Field + ball + yellow/blue Pinky -> compiled MjModel."""
+def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.0003, markings=True, hull_verts=0, visuals=True):
+    """Field + ball + yellow/blue Pinky -> compiled MjModel.  markings=False leaves out the painted lines (visual
+    only).  hull_verts > 0 caps the collision hulls of the robot meshes (up to 11k vertices: the physics of
+    several processes then fights over the CPU cache and does not scale - RL training uses 64).  visuals=False
+    drops every non-colliding geom and unused mesh (RL training: nothing is rendered)."""
     from ament_index_python.packages import get_package_share_directory
     from pinky_mujoco.model import build_model
     from pinky_soccer_sim.urdf_tools import build_urdf
@@ -90,6 +93,8 @@ def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.0003):
     L, W, G, strip = resolve_dims(style)
     cfg = FieldSpec(length=L, width=W, goal_width=G, style=style).rcj_cfg()
     for i, o in enumerate(rcj_field.scene(cfg)):
+        if not markings and not o['collision']:
+            continue
         if o['kind'] == 'cylinder':                                 # neutral spots
             shape, size = mujoco.mjtGeom.mjGEOM_CYLINDER, [o['radius'], o['length'] / 2, 0]
         else:
@@ -136,8 +141,20 @@ def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.0003):
             name=f'{team}/rplidar_head_collision', type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[0.028, 0.02, 0],
             rgba=[0.1, 0.1, 0.1, 1])        # opaque: rays skip alpha-0 geoms (hidden groups anyway)
         head.contype, head.conaffinity, head.group = ROBOT_BITS[0], ROBOT_BITS[1], LIDAR_GROUP[team]
+    if not visuals:
+        for b in spec.bodies:
+            for g in list(b.geoms):
+                if g.contype == 0 and g.conaffinity == 0:
+                    spec.delete(g)
+        used = {g.meshname for b in spec.bodies for g in b.geoms if g.meshname}
+        for mesh in list(spec.meshes):
+            if mesh.name not in used:
+                spec.delete(mesh)
+    if hull_verts:
+        for mesh in spec.meshes:
+            mesh.maxhullvert = int(hull_verts)
     compiled = spec.compile()                                  # panel pose from a first compile (mesh recentring)
-    for team in SCREEN_IMAGES:
+    for team in SCREEN_IMAGES if visuals else ():
         _add_screen(spec, team, compiled)
     model = spec.compile()
     # robot collision shapes: collide with each other too, and sit in a per-team group for the lidars

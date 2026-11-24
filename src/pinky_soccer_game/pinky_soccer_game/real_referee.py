@@ -61,6 +61,7 @@ class RealReferee(Node):
         P('wall_zone', 0.07)            # m: ball this close to the boundary line (or beyond; robots must not
                                         # cross the line - goal mouths excepted) ...
         P('wall_stuck_time', 10.0)      # ... lying still this long -> ask for the ball on the centre spot
+        P('stuck_time', 20.0)           # ball not moving at all this long anywhere (deadlock) -> same
                                         # (robots play on: nobody can get behind a ball on the wall)
         self.L = self.get_parameter('field_length').value
         self.W = self.get_parameter('field_width').value
@@ -419,6 +420,11 @@ class RealReferee(Node):
                 ref = self._still_ball(now)
                 wz = self.get_parameter('wall_zone').value
                 on_wall = ((self.L / 2 - abs(b[0]) < wz and abs(b[1]) > self.G / 2) or self.W / 2 - abs(b[1]) < wz)
+                stuck = ref is not None and now - ref[2] > self.get_parameter('stuck_time').value
+                if stuck and not on_wall and now - self.last_out > 10.0:
+                    self.last_out = now
+                    self.pub_fx.publish(String(data='CORNER'))
+                    self._event('공이 20초 동안 안 움직임 (막힘) - 로봇은 그대로, 공만 가운데에 놓아 주세요')
                 if on_wall and ref is not None and now - ref[2] > self.get_parameter('wall_stuck_time').value \
                         and now - self.last_out > 10.0:
                     self.last_out = now

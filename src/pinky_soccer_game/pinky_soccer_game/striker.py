@@ -16,6 +16,7 @@ Final destination ("상대방 최종 목적지 좌표"):
   at runtime;  `side_aim` shifts the aim to the side away from the goalkeeper.
 """
 import math
+import os
 import time
 
 import numpy as np
@@ -111,6 +112,8 @@ class Striker(Node):
         P('search_w', 1.5)                 # [rad/s] spin while looking for the ball (real robot: slow, 0.6)
         P('lost_backup_time', 2.0)         # [s] ball vanished right in front -> back up to see it, not spin
         P('outer_strip', FIELD_STRIP)      # field edge -> wall distance (detour points may use it)
+        P('policy_path', '')               # RL policy (.npz from pinky_soccer_rl.export): plays the PLAY phase
+                                           # instead of the rule-based state machine; '' = rules
         P('line_guard', True)              # never drive over the white boundary line (camera, line/boundary)
         P('robot_front', 0.05)             # [m] base_footprint -> bumper front
         P('robot_back', 0.08)              # [m] base_footprint -> rear
@@ -183,6 +186,15 @@ class Striker(Node):
                                         self._line_guard)
         self.line_pts, self.line_t, self.line_stops = np.zeros((0, 2)), 0.0, 0
         self.create_subscription(PoseArray, 'line/boundary', self._line, 10)
+        self.rl, self.rl_t, self.rl_cmd = None, 0.0, (0.0, 0.0)
+        self.guard_since, self.rl_escape_until = None, 0.0
+        self.guard_hit = False
+        path = os.path.expanduser(self.get_parameter('policy_path').value)
+        if path:
+            from pinky_soccer_game.rl_policy import RLPlayer
+            self.rl = RLPlayer(path, self.L, self.W, self.attack_yaw)
+            self.get_logger().info(f'RL policy {path} plays (attack yaw {self.attack_yaw:+.2f}, '
+                                   f'opponent input {"on" if self.rl.pol.use_opponent else "off"})')
         # localisation guard: a pose outside the walls is impossible -> re-seed AMCL (relative topic: the
         # namespaced sim AMCL or the real robot's own in its domain)
         self.initpose_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
@@ -222,6 +234,8 @@ class Striker(Node):
             self.get_logger().info('preparing at the yellow goal')
         elif msg.data == 'START':
             self.match_phase = 'PLAY'
+            if self.rl is not None:
+                self.rl.reset()
             self.concede_xy = None
             if self.scored_last:          # we scored the last goal: the other team gets a head start
                 self.hold_until = time.time() + self.get_parameter('scorer_delay').value
@@ -276,6 +290,36 @@ class Striker(Node):
             self.set_state('CELEBRATE_DONE')
         self.cmd_pub.publish(cmd)
 
+    def _rl_play(self, pose, now):
+        """PLAY with the learned policy: a new action every 0.1 s (the training rate), repeated in between."""
+        if now - self.rl_t >= 0.095:
+            seen = self.ball is not None and now - self.ball_t < 0.25
+            since = (now - self.ball_t) if self.ball is not None else 5.0
+            opp = self.estimate_opponent(pose)
+            v, w, _ = self.rl.act(pose, self.ball, seen, since, opp)
+            self.rl_cmd, self.rl_t = (v, w), now
+        self.cancel_nav()
+        cmd = Twist()
+        if now < self.rl_escape_until:
+            # safety net: the line guard kept blocking the policy -> face the field centre for a moment
+            err = wrap(math.atan2(-pose[1], -pose[0]) - pose[2])
+            cmd.angular.z = clip(2.5 * err, -2.0, 2.0)
+            cmd.linear.x = 0.10 if abs(err) < 0.4 else 0.0
+            self.cmd_pub.publish(cmd)
+            self.set_state('RL_ESCAPE')
+            return
+        cmd.linear.x, cmd.angular.z = self.rl_cmd
+        self.guard_hit = False
+        self.cmd_pub.publish(cmd)                    # line guard still applies
+        if self.guard_hit:
+            self.guard_since = self.guard_since or now
+            if now - self.guard_since > 1.5:
+                self.rl_escape_until, self.guard_since = now + 1.0, None
+                self.get_logger().info('RL policy blocked by the boundary line for 1.5 s -> turn to the centre')
+        else:
+            self.guard_since = None
+        self.set_state('RL_PLAY')
+
     def _line(self, m):
         self.line_pts = np.array([[q.position.x, q.position.y] for q in m.poses]).reshape(-1, 2)
         self.line_t = time.time()
@@ -296,6 +340,7 @@ class Striker(Node):
             hit = lateral & (p[:, 0] > -0.02) & (p[:, 0] < g('robot_front') + reach)
         else:
             hit = lateral & (p[:, 0] < 0.02) & (p[:, 0] > -(g('robot_back') + reach))
+        self.guard_hit = bool(hit.any())
         if hit.any():
             cmd.linear.x = 0.0
             self.line_stops += 1
@@ -621,6 +666,9 @@ class Striker(Node):
             self.cancel_nav()
             self.stop()
             self.set_state('SCORER_WAIT')
+            return
+        if self.rl is not None:
+            self._rl_play((rx, ry, ryaw), time.time())
             return
         if self.match_control and self.kickoff in ('YELLOW', 'BLUE') and self.kickoff != me_team:
             # the other team's kickoff: it must touch the ball first -> stay at the start position

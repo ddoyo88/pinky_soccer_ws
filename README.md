@@ -58,7 +58,10 @@
 | 로봇 LED·LCD·소리 (로봇에서 실행) | [`pinky_display.py`](src/pinky_soccer_vision/robot/pinky_display.py) |
 | 실행 묶음 (시뮬 / 실물) | [`sim_duel.launch.py`](src/pinky_soccer_bringup/launch/sim_duel.launch.py), [`real_duel.launch.py`](src/pinky_soccer_bringup/launch/real_duel.launch.py) |
 
-더 자세한 설명과 공부 순서: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+더 자세한 문서:
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): 구조 그림, 데이터 흐름, 공부 순서
+- [docs/CODE_GUIDE.md](docs/CODE_GUIDE.md): **파일별 역할, 토픽, 설정값, 설정 파일 위치, 경기 진행 순서**
+- [docs/RL_TRAINING.md](docs/RL_TRAINING.md): 강화학습 설계, 학습 순서, 결과 기록
 
 ### 폴더 구성
 ```
@@ -70,6 +73,7 @@ src/
   pinky_soccer_vision         공 검출, 보정 창, YOLO 학습, 로봇용 프로그램(robot/)
   pinky_soccer_game           striker · referee · real_referee · match_ui · sensor_view · domain_relay
   pinky_soccer_bringup        실행 묶음: sim_duel / real_duel / stage1~6
+  pinky_soccer_rl             강화학습: 학습 환경(MuJoCo), PPO 학습, 정책 재생
 scripts/                      설치, 보정 창 실행, 점검 스크립트
 scripts/robot/                로봇에 복사해서 쓰는 시작·정지 스크립트
 config/                       CycloneDDS 설정 예시 (PC / 로봇)
@@ -224,7 +228,7 @@ pip install ultralytics --break-system-packages
 - 체커보드는 **안쪽 코너**(네 칸이 만나는 점)만 검출합니다. 보드 테두리 바깥 코너가 안 잡히는 것은 정상입니다.
 - 카메라 화면 위쪽에 `front / side / dist`로 공 위치가 나옵니다. 줄자로 잰 값과 비교해서 0.6 m에서 ±3 cm, 1.0 m에서 ±5 cm 안이면 합격입니다.
 - **카메라 값**(HSV, 각도, 렌즈)은 `real_duel`이 시작할 때 yaml에서 읽어 공 검출에 넣습니다. 터미널에 `[real_duel] <팀> camera calibration from ...`이 나오면 적용된 것입니다.
-- **바퀴 값**은 로봇의 모터 드라이버가 쓰므로 yaml은 기록용입니다. 로봇의 `~/start_robot.sh`에서 `WHEEL_RADIUS` / `WHEEL_SEPARATION`을 고치고 드라이버를 다시 켜야 적용됩니다.
+- **바퀴 값**은 로봇의 모터 드라이버가 쓰므로 yaml은 기록용입니다. 로봇에 적용하려면 `./scripts/apply_wheel_calib.sh <팀> pinky@<로봇 IP>`를 실행합니다. 로봇의 `~/start_robot.sh`에 값을 넣고 드라이버를 다시 켭니다.
 - 다른 PC에서 보정한 파일도 같은 이름(`camera_yellow.yaml` / `camera_blue.yaml`)으로 `~/.config/pinky_soccer/`에 넣으면 됩니다.
 
 ---

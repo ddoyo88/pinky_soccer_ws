@@ -89,6 +89,7 @@ def _robot(context, team, domain, gz_prefix, pose, L, W, G, strip, v, sim='gz'):
     attack_yaw = 0.0 if team == 'yellow' else math.pi
     striker = solo_striker_params(L, W, G, strip, float(v('max_speed')), 
                                   match=True, sim_time=True)
+    striker['policy_path'] = v(f'policy_{team}')       # '' = rule-based striker
     striker.update({'team': team, 'goal_x': attack_x, 'attack_yaw': attack_yaw,
                     'ready_offset': _start_offset(v),           # on the white line in front of the own goal
                     # avoid_opponent (default): the other robot nearby is an obstacle to go round
@@ -211,6 +212,10 @@ def generate_launch_description():
                               description="start pose from the own goal line [m]; 'line' = on the penalty line"),
         DeclareLaunchArgument('cam_tilt_deg', default_value='20'),
         DeclareLaunchArgument('win_score', default_value='5'),
+        DeclareLaunchArgument('policy_yellow', default_value='',
+                              description='RL policy .npz (pinky_soccer_rl.export) for yellow; empty = rules'),
+        DeclareLaunchArgument('policy_blue', default_value='',
+                              description='RL policy .npz for blue; empty = rules'),
         DeclareLaunchArgument('avoid_opponent', default_value='true',
                               description='true: the other robot is an obstacle (slow down / go round it); '
                                           'false: contact allowed'),

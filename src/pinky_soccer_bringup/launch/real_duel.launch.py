@@ -64,6 +64,7 @@ def launch_setup(context):
         sign = 1.0 if team == 'yellow' else -1.0                   # yellow attacks +X, blue -X
         x0, yaw0 = -sign * (L / 2 - start), (0.0 if team == 'yellow' else math.pi)
         striker = solo_striker_params(L, W, G, strip, vmax, match=True, sim_time=False)
+        striker['policy_path'] = v(f'policy_{team}')       # '' = rule-based striker
         striker.update({'team': team, 'goal_x': sign * L / 2, 'attack_yaw': yaw0, 'ready_offset': start,
                         'use_opponent': v('avoid_opponent').lower() == 'true'})
         return GroupAction(scoped=True, actions=[
@@ -121,6 +122,10 @@ def generate_launch_description():
                               description='deg, camera pitch correction of the yellow robot (measured)'),
         DeclareLaunchArgument('cam_pitch_blue', default_value='-7.1',
                               description='deg, camera pitch correction of the blue robot (measured)'),
+        DeclareLaunchArgument('policy_yellow', default_value='',
+                              description='RL policy .npz (pinky_soccer_rl.export) for yellow; empty = rules'),
+        DeclareLaunchArgument('policy_blue', default_value='',
+                              description='RL policy .npz for blue; empty = rules'),
         DeclareLaunchArgument('avoid_opponent', default_value='true'),
         DeclareLaunchArgument('win_score', default_value='5'),
         DeclareLaunchArgument('sensor_view', default_value='true'),

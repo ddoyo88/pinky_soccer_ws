@@ -55,7 +55,8 @@ class Referee(Node):
         self.declare_parameter('sim_backend', 'gz')          # gz | mujoco (how the ball / a robot is moved)
         self.declare_parameter('yellow_initialpose_topic', '/initialpose')   # duel: /yellow/initialpose
         self.declare_parameter('ball_radius', 0.02135)
-        self.declare_parameter('stuck_timeout', 0.0)       # s without ball movement -> centre; 0 = off
+        self.declare_parameter('stuck_timeout', 20.0)      # s without ANY ball movement (deadlock: both robots
+                                                           # stuck next to it) -> centre; 0 = off
                                                            # (match rule: a ball lying alone is left alone)
         self.declare_parameter('wedge_timeout', 5.0)       # s, ball stuck together with a robot -> centre
         self.declare_parameter('wall_zone', 0.06)          # m: ball this close to the boundary LINE (or beyond
@@ -516,7 +517,8 @@ class Referee(Node):
                         self.last_move_t = now
                 elif (wedged and still > self.get_parameter('wedge_timeout').value) \
                         or 0 < self.get_parameter('stuck_timeout').value < still:
-                    if self._centre_ball('공이 모서리에 걸려 못 빠져나옴 -> 중앙으로'):
+                    if self._centre_ball('공이 모서리에 걸려 못 빠져나옴 -> 중앙으로' if wedged else
+                                         '공이 20초 동안 안 움직임 (막힘) -> 공만 중앙으로, 경기 계속'):
                         self.last_ball = None
                         self.last_move_t = now
             return
