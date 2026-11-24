@@ -20,7 +20,7 @@ import time
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PointStamped, PoseStamped, Twist
+from geometry_msgs.msg import PointStamped, PoseArray, PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
@@ -37,6 +37,16 @@ from pinky_soccer_game.avoidance import PrepareRouter, avoid_opponent, detour_ta
 
 # defaults = the default field (pinky_soccer_sim/config/field_hardboard.yaml); launch files pass the real values
 FIELD_L, FIELD_W, FIELD_G, FIELD_STRIP = default_dims()
+
+
+class GuardedPublisher:
+    """cmd_vel publisher with a last check (the white boundary line) applied to every command."""
+
+    def __init__(self, pub, guard):
+        self.pub, self.guard = pub, guard
+
+    def publish(self, cmd):
+        self.pub.publish(self.guard(cmd))
 
 
 def clip(v, lo, hi):
@@ -88,7 +98,12 @@ class Striker(Node):
         P('orbit_radius', 0.24)            # [m] circle around the ball when we are on the wrong side of it
                                            # (real robot: 0.32 = wide loop, room to line up for the shot)
         P('celebrate', True)               # after OUR goal: drive between own goal and centre line, spin
-        P('celebrate_turns', 5.0)          # full turns on the spot
+        P('celebrate_turns', 3.0)          # full turns on the spot
+        P('concede_centre', True)          # the other team scored: go to the centre line (on our side, away
+                                           # from the scorer) first, then back to our start pose - not standing
+                                           # in front of our goal where the scorer is
+        P('concede_hold', 1.5)             # [s] wait at the centre-line point before going back
+        P('scorer_delay', 3.0)             # [s] after a restart the team that scored last waits this long
         P('celebrate_w', 3.0)              # [rad/s] spin speed (real wheels allow ~5.9)
         P('use_opponent', True)            # False: no opponent on the field (real single-robot run) -> lidar
                                            # points that do not match the map are NOT dodged
@@ -96,6 +111,11 @@ class Striker(Node):
         P('search_w', 1.5)                 # [rad/s] spin while looking for the ball (real robot: slow, 0.6)
         P('lost_backup_time', 2.0)         # [s] ball vanished right in front -> back up to see it, not spin
         P('outer_strip', FIELD_STRIP)      # field edge -> wall distance (detour points may use it)
+        P('line_guard', True)              # never drive over the white boundary line (camera, line/boundary)
+        P('robot_front', 0.05)             # [m] base_footprint -> bumper front
+        P('robot_back', 0.08)              # [m] base_footprint -> rear
+        P('robot_half_width', 0.065)       # [m]
+        P('line_margin', 0.03)             # [m] stop this far before the line (+ braking distance)
 
         L = self.get_parameter('field_length').value
         gx = self.get_parameter('goal_x').value
@@ -130,8 +150,11 @@ class Striker(Node):
         self.match_phase = 'WAIT' if self.match_control else 'PLAY'
         self.ready_goal_sent = False
         self.kickoff = 'OPEN'
+        self.concede_xy, self.concede_t0, self.concede_hold_t = None, 0.0, None
+        self.scored_last, self.hold_until = False, 0.0
         self.stuck_ref = None
         self.backoff_until = 0.0
+        self.jam_count, self.jam_last_t, self.escape_until = 0, 0.0, 0.0
         self.backoff_v = -0.10
         self.orbit_dir = None              # +1 / -1 while circling the ball (kept until lined up)
         self.search_phase = None           # ball lost: back -> spin -> roam (see search())
@@ -156,7 +179,14 @@ class Striker(Node):
             self.create_subscription(String, '/game/kickoff', self._kickoff, 10)
             self.create_subscription(String, '/game/goal', self._goal_scored, 10)
 
-        self.cmd_pub = self.create_publisher(Twist, self.get_parameter('cmd_topic').value, 10)
+        self.cmd_pub = GuardedPublisher(self.create_publisher(Twist, self.get_parameter('cmd_topic').value, 10),
+                                        self._line_guard)
+        self.line_pts, self.line_t, self.line_stops = np.zeros((0, 2)), 0.0, 0
+        self.create_subscription(PoseArray, 'line/boundary', self._line, 10)
+        # localisation guard: a pose outside the walls is impossible -> re-seed AMCL (relative topic: the
+        # namespaced sim AMCL or the real robot's own in its domain)
+        self.initpose_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
+        self.reseed_t = 0.0
         self.state_pub = self.create_publisher(String, 'game/state', 10)   # /<ns>/game/state
         self.opp_pub = self.create_publisher(PointStamped, 'opponent/position_map', 10)
         self.nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -192,6 +222,10 @@ class Striker(Node):
             self.get_logger().info('preparing at the yellow goal')
         elif msg.data == 'START':
             self.match_phase = 'PLAY'
+            self.concede_xy = None
+            if self.scored_last:          # we scored the last goal: the other team gets a head start
+                self.hold_until = time.time() + self.get_parameter('scorer_delay').value
+            self.scored_last = False
             self.t_start = time.time() - self.get_parameter('start_delay').value
             self.cancel_nav()
             self.get_logger().info('match started')
@@ -202,13 +236,15 @@ class Striker(Node):
             self.spin_done, self.spin_last = 0.0, None
         elif msg.data == 'WAIT':
             self.celebrating = False
+            self.concede_xy, self.scored_last, self.hold_until = None, False, 0.0
             self.match_phase = 'WAIT'
             self.cancel_nav()
 
     def _goal_scored(self, msg):
         """/game/goal: the team that just scored (sent by the referee right before GOAL)."""
-        self.celebrating = self.get_parameter('celebrate').value and \
-            msg.data.strip().upper() == self.get_parameter('team').value.upper()
+        mine = msg.data.strip().upper() == self.get_parameter('team').value.upper()
+        self.celebrating = self.get_parameter('celebrate').value and mine
+        self.scored_last = mine
         self.spin_done, self.spin_last = 0.0, None
 
     def celebrate(self, rx, ry, ryaw):
@@ -240,6 +276,41 @@ class Striker(Node):
             self.set_state('CELEBRATE_DONE')
         self.cmd_pub.publish(cmd)
 
+    def _line(self, m):
+        self.line_pts = np.array([[q.position.x, q.position.y] for q in m.poses]).reshape(-1, 2)
+        self.line_t = time.time()
+
+    def _line_guard(self, cmd):
+        """Boundary points (base frame, from the camera) inside the strip the robot would sweep next -> no
+        motion in that direction (turning stays allowed, so the robot can face away and carry on)."""
+        if not self.get_parameter('line_guard').value or time.time() - self.line_t > 1.0 or not len(self.line_pts):
+            return cmd
+        v = cmd.linear.x
+        if abs(v) < 1e-3:
+            return cmd
+        g = lambda n: self.get_parameter(n).value  # noqa: E731
+        p = self.line_pts
+        lateral = np.abs(p[:, 1]) < g('robot_half_width') + 0.01
+        reach = g('line_margin') + 0.25 * abs(v)                    # + braking distance (smoother, 0.25 s)
+        if v > 0:
+            hit = lateral & (p[:, 0] > -0.02) & (p[:, 0] < g('robot_front') + reach)
+        else:
+            hit = lateral & (p[:, 0] < 0.02) & (p[:, 0] > -(g('robot_back') + reach))
+        if hit.any():
+            cmd.linear.x = 0.0
+            self.line_stops += 1
+            if self.line_stops % 20 == 1:
+                self.get_logger().info(f'boundary line {"ahead" if v > 0 else "behind"}: stop '
+                                       f'({int(hit.sum())} line points)')
+        return cmd
+
+    def concede_point(self, pose):
+        """Centre-line point on our own side, 0.15 m from the line, to the side away from the other robot."""
+        n = np.array([math.cos(self.attack_yaw), math.sin(self.attack_yaw)])
+        opp = self.estimate_opponent(pose) if self.get_parameter('use_opponent').value else None
+        side = -1.0 if (opp is not None and opp[1] > 0) else 1.0
+        return -n * 0.15 + np.array([0.0, side * self.W / 4])
+
     # ------------------------------------------------------------------ helpers
     def robot_pose(self):
         try:
@@ -247,7 +318,31 @@ class Striker(Node):
                                                 rclpy.time.Time())
         except tf2_ros.TransformException:
             return None
-        return (t.transform.translation.x, t.transform.translation.y, yaw_from_quat(t.transform.rotation))
+        pose = (t.transform.translation.x, t.transform.translation.y, yaw_from_quat(t.transform.rotation))
+        self._localisation_guard(pose)
+        return pose
+
+    def _localisation_guard(self, pose):
+        """Wheel slip (pushing the other robot / a wall) can carry AMCL off; with its particles packed tight it
+        does not come back by itself.  The robot centre can never be within 6 cm of a wall: if AMCL says so,
+        re-seed it around the nearest possible point with a wide spread (0.3 m, same heading - the field is
+        point-symmetric, a heading reset could flip it) so the lidar pulls it back onto the walls."""
+        x, y, yaw = pose
+        strip = self.get_parameter('outer_strip').value
+        hx, hy = self.L / 2 + strip - 0.06, self.W / 2 + strip - 0.06
+        if (abs(x) <= hx + 0.03 and abs(y) <= hy + 0.03) or time.time() - self.reseed_t < 3.0:
+            return
+        self.reseed_t = time.time()
+        cx, cy = clip(x, -hx + 0.05, hx - 0.05), clip(y, -hy + 0.05, hy - 0.05)
+        m = PoseWithCovarianceStamped()
+        m.header.frame_id = 'map'
+        m.pose.pose.position.x, m.pose.pose.position.y = cx, cy
+        m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+        m.pose.covariance[0] = m.pose.covariance[7] = 0.09
+        m.pose.covariance[35] = 0.03
+        self.initpose_pub.publish(m)
+        self.get_logger().warning(f'localisation outside the field ({x:+.2f}, {y:+.2f}) -> AMCL re-seeded around '
+                                  f'({cx:+.2f}, {cy:+.2f})')
 
     def on_static_map(self, x, y):
         if self.map is None:
@@ -423,6 +518,10 @@ class Striker(Node):
             self.match_phase = 'PREPARE'
             self.router.reset()
             self.cancel_nav()
+            pose = self.robot_pose()
+            if self.get_parameter('concede_centre').value and pose is not None:
+                self.concede_xy = self.concede_point(pose)
+                self.concede_t0, self.concede_hold_t = time.time(), None
         if self.match_control and self.match_phase in ('WAIT', 'GOAL'):
             self.stop()
             self.set_state(self.match_phase)
@@ -441,12 +540,40 @@ class Striker(Node):
             ready_pose = own_goal + n_att * self.get_parameter('ready_offset').value
             ready_yaw = self.attack_yaw
             dist = float(np.linalg.norm(np.array([rx, ry]) - ready_pose))
-            if dist < 0.05 and abs(wrap(ryaw - ready_yaw)) < 0.15:
+            yaw_err = abs(wrap(ryaw - ready_yaw))
+            if self.match_phase == 'READY':
+                # hysteresis: the localisation jitters by a few cm - stay READY (and still) unless the robot
+                # really got moved off its start pose (then line up again)
+                if dist < 0.12 and yaw_err < 0.35:
+                    self.cancel_nav()
+                    self.stop()
+                    self.set_state('READY')
+                    return
+                self.match_phase = 'PREPARE'
+                self.router.reset()
+            if self.concede_xy is not None:
+                # conceded: first to the centre-line point (out of the scorer's way), wait, then back
+                cdist = float(np.linalg.norm(np.array([rx, ry]) - self.concede_xy))
+                if cdist < 0.08 or time.time() - self.concede_t0 > 20.0:
+                    if self.concede_hold_t is None:
+                        self.concede_hold_t = time.time()
+                    if time.time() - self.concede_hold_t < self.get_parameter('concede_hold').value:
+                        self.cancel_nav()
+                        self.stop()
+                        self.set_state('CONCEDE_CENTRE')
+                        return
+                    self.concede_xy = None
+                    self.router.reset()
+                    self.cancel_nav()
+                else:
+                    ready_pose, ready_yaw = self.concede_xy, self.attack_yaw
+                    dist, yaw_err = cdist, 1.0                # never READY on the way to the centre line
+            if dist < 0.05 and yaw_err < 0.15:
                 self.cancel_nav()
                 self.stop()
                 self.match_phase = 'READY'
                 self.set_state('READY')
-            elif self.match_phase == 'PREPARE':
+            else:
                 opp = self.estimate_opponent(pose)
                 route = self.router.update((rx, ry, ryaw), ready_pose, opp, time.time(),
                                            moving_wanted=dist > 0.05)
@@ -485,13 +612,16 @@ class Striker(Node):
                     # around the tiny replanned path.  Drive there directly, backing up if that is shorter.
                     self.cancel_nav()
                     self.cmd_pub.publish(self.direct_goto(rx, ry, ryaw, ready_pose, ready_yaw))
-                self.set_state('PREPARING')
-            else:
-                self.stop()
-                self.set_state('PREPARING')
+                self.set_state('CONCEDE_GO' if self.concede_xy is not None else 'PREPARING')
             return
 
         me_team = self.get_parameter('team').value.upper()
+        if self.match_control and time.time() < self.hold_until:
+            # we scored the last goal: stand still for scorer_delay after the restart (fair chances)
+            self.cancel_nav()
+            self.stop()
+            self.set_state('SCORER_WAIT')
+            return
         if self.match_control and self.kickoff in ('YELLOW', 'BLUE') and self.kickoff != me_team:
             # the other team's kickoff: it must touch the ball first -> stay at the start position
             self.cancel_nav()
@@ -513,19 +643,35 @@ class Striker(Node):
             self.cmd_pub.publish(cmd)                 # not through the collision filter: we move away
             self.set_state('BACKOFF')
             return
+        if now < self.escape_until:
+            # jammed again and again (e.g. hooked on a goal post): after the long back-off turn to the
+            # field centre and drive a little towards it before playing on
+            self.cancel_nav()
+            err = wrap(math.atan2(-ry, -rx) - ryaw)
+            cmd = Twist()
+            cmd.angular.z = clip(2.5 * err, -2.0, 2.0)
+            cmd.linear.x = 0.10 if abs(err) < 0.5 else 0.0
+            self.cmd_pub.publish(cmd)
+            self.set_state('ESCAPE')
+            return
         ref = self.stuck_ref
         if ref is None or math.hypot(rx - ref[0], ry - ref[1]) > 0.02 or abs(wrap(ryaw - ref[2])) > 0.1 \
-                or self.state in ('NO_ROOM', 'KICKOFF_WAIT'):           # standing still on purpose
+                or self.state in ('NO_ROOM', 'KICKOFF_WAIT', 'OUT'):    # standing still on purpose
             self.stuck_ref = (rx, ry, ryaw, now)
         elif now - ref[3] > self.get_parameter('stuck_time').value:
             near = self.nearest_obstacle()
             ball_far = self.ball is None or float(np.linalg.norm(self.ball - r)) > 0.12
             if (near is not None and near[0] < self.get_parameter('jam_dist').value) or ball_far:
+                self.jam_count = self.jam_count + 1 if now - self.jam_last_t < 8.0 else 1
+                self.jam_last_t = now
                 dist = self.get_parameter('backoff_dist').value
+                if self.jam_count >= 2:                      # the short back-off did not free us
+                    dist = max(dist, 0.15)
                 speed = 0.10
                 front = near is None or near[1]
                 self.backoff_v = -speed if front else speed  # away from whatever we are pressed against
                 self.backoff_until = now + dist / speed
+                self.escape_until = self.backoff_until + (1.5 if self.jam_count >= 2 else 0.0)
                 self.get_logger().info(f'jammed -> {dist * 100:.0f} cm back'
                                        f'{" (obstacle %.2f m)" % near[0] if near else ""}')
             self.stuck_ref = None
@@ -552,7 +698,7 @@ class Striker(Node):
         self.search_phase = None                      # ball (re)found: the next loss starts a fresh search
 
         self.play_ctx = ((rx, ry, ryaw), opp, (float(b[0]), float(b[1])))
-        if abs(b[0]) > self.L / 2 + 0.01 and abs(b[1]) > self.G / 2:
+        if abs(b[0]) > self.L / 2 + 0.04 and abs(b[1]) > self.G / 2:       # 4 cm: camera estimate error
             # ball behind a goal line but beside the goal: out of play, cannot be scored -> wait for the
             # referee / a person to put it back instead of circling it next to the wall
             self.cancel_nav()

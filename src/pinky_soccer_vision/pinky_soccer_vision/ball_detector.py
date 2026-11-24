@@ -11,18 +11,27 @@ ball-centre height (known ball radius) -> no depth camera needed.
 
 Publishes:  /ball/position_base (PointStamped, base_footprint)   /ball/position_map (PointStamped, map)
             /ball/detection_image (Image, debug overlay)
+            /line/boundary (PoseArray, base_footprint) white BOUNDARY-line points around the robot (see below)
+
+Field lines (detect_lines): white floor pixels (low saturation, bright) below the horizon are projected onto the
+floor like the ball.  A point counts as the BOUNDARY line when, placed on the map with the robot's localisation,
+it lies within `boundary_band` of the field edge (the centre / penalty lines are well inside; the goal mouths
+are left out - the ball has to go in there).  The camera cannot see the floor right in front of the bumper, so
+boundary points are remembered in the odom frame for `line_memory` s and re-published every frame in the
+current base frame: the striker never drives the robot over them.
 """
 import math
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_msgs.msg import TFMessage
 import tf2_ros
 
+from pinky_soccer_sim.field import default_dims
 from pinky_soccer_sim.gz_utils import PoseTracker, yaw_from_quat
 
 
@@ -64,6 +73,18 @@ class BallDetector(Node):
         # empty = camera_info / FOV fallback
         self.declare_parameter('intrinsics', [0.0])
         self.declare_parameter('distortion', [0.0])          # real robot: JPEG on /camera/image_raw/compressed
+        # white field lines -> boundary guard
+        L0, W0, G0, _ = default_dims()
+        self.declare_parameter('detect_lines', True)
+        self.declare_parameter('field_length', L0)
+        self.declare_parameter('field_width', W0)
+        self.declare_parameter('goal_width', G0)
+        self.declare_parameter('line_s_max', 60)            # white: saturation below this ...
+        self.declare_parameter('line_v_min', 170)           # ... and brightness above this
+        self.declare_parameter('line_range', 0.9)           # [m] farther floor points are too coarse
+        self.declare_parameter('boundary_band', 0.07)       # [m] from the field edge (localisation error margin)
+        self.declare_parameter('line_memory', 4.0)          # [s] keep boundary points (camera blind spot)
+        self.line_mem = {}                                  # 2 cm grid cell -> (x, y, t) in odom
 
         self.backend = self.get_parameter('backend').value
         self.ball_r = self.get_parameter('ball_radius').value
@@ -78,6 +99,8 @@ class BallDetector(Node):
         self.pub_base = self.create_publisher(PointStamped, 'ball/position_base', 10)
         self.pub_map = self.create_publisher(PointStamped, 'ball/position_map', 10)
         self.pub_dbg = self.create_publisher(Image, 'ball/detection_image', 1)
+        self.pub_line = self.create_publisher(PoseArray, 'line/boundary', 10)
+        self.line_px = None                                 # (boundary pixels, other line pixels) for debug
 
         if self.backend == 'gt':
             self.tracker = PoseTracker()
@@ -196,6 +219,8 @@ class BallDetector(Node):
                                    f'cx={intr[2]:.1f} cy={intr[3]:.1f}')
         if self.K is None:
             self._fallback_K(rgb)
+        if self.get_parameter('detect_lines').value:
+            self._lines(rgb, msg.header.frame_id)
         cands = self._detect_yolo(rgb) if self.backend == 'yolo' else self._detect_hsv(rgb)
         det = None
         for c in cands[:5]:
@@ -205,34 +230,43 @@ class BallDetector(Node):
         if self.get_parameter('publish_debug').value:
             self._debug(rgb, det, msg)
 
-    def _localise(self, det, cam_frame, stamp):
+    def _rays(self, uv, cam_frame):
+        """Pixels (N x 2) -> (camera origin, ray directions N x 3) in the base frame, or None (no TF yet).
+        Lens distortion, optical/link axes and the cam_pitch_deg correction as calibrated."""
         fx, fy, cx, cy = self.K
-        u, v = det[0], det[1]
+        uv = np.asarray(uv, dtype=float).reshape(-1, 2)
         if getattr(self, 'dist', None) is not None and getattr(self, 'K_source', '') == 'calibrated':
-            import cv2                                     # lens distortion out of the ball centre pixel
+            import cv2                                     # lens distortion out of the pixels
             Km = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=float)
-            u, v = cv2.undistortPoints(np.array([[[u, v]]], dtype=float), Km, self.dist, P=Km)[0, 0]
+            uv = cv2.undistortPoints(uv.reshape(-1, 1, 2), Km, self.dist, P=Km).reshape(-1, 2)
+        a, b = (uv[:, 0] - cx) / fx, (uv[:, 1] - cy) / fy
+        one = np.ones_like(a)
         if 'optical' in cam_frame:
             # image already in the optical frame (x right, y down, z forward; real robots' camera_publisher)
-            d_cam = np.array([(u - cx) / fx, (v - cy) / fy, 1.0])
+            d_cam = np.stack([a, b, one], axis=1)
         else:
             # ray in the camera link (x fwd, y left, z up; Pinky: front_camera_link) from optical (x right, y down, z fwd)
-            d_cam = np.array([1.0, -(u - cx) / fx, -(v - cy) / fy])
+            d_cam = np.stack([one, -a, -b], axis=1)
         pitch = math.radians(self.get_parameter('cam_pitch_deg').value)
+        c, s = math.cos(pitch), math.sin(pitch)
         if pitch and 'optical' in cam_frame:              # same nose-down rotation, optical axes (x right, y down)
-            d_cam = np.array([d_cam[0], d_cam[1] * math.cos(pitch) + d_cam[2] * math.sin(pitch),
-                              -d_cam[1] * math.sin(pitch) + d_cam[2] * math.cos(pitch)])
+            d_cam = np.stack([d_cam[:, 0], d_cam[:, 1] * c + d_cam[:, 2] * s, -d_cam[:, 1] * s + d_cam[:, 2] * c], 1)
         elif pitch:                                         # rotate about the camera y axis (nose down)
-            d_cam = np.array([d_cam[0] * math.cos(pitch) + d_cam[2] * math.sin(pitch), d_cam[1],
-                              -d_cam[0] * math.sin(pitch) + d_cam[2] * math.cos(pitch)])
+            d_cam = np.stack([d_cam[:, 0] * c + d_cam[:, 2] * s, d_cam[:, 1], -d_cam[:, 0] * s + d_cam[:, 2] * c], 1)
         try:
             t_bc = self.tf_buffer.lookup_transform(self.base_frame, cam_frame, rclpy.time.Time())
         except tf2_ros.TransformException:
-            return False
+            return None
         R = quat_to_rot(t_bc.transform.rotation)
         o = np.array([t_bc.transform.translation.x, t_bc.transform.translation.y,
                       t_bc.transform.translation.z])
-        d = R @ d_cam
+        return o, d_cam @ R.T
+
+    def _localise(self, det, cam_frame, stamp):
+        rays = self._rays([det[0], det[1]], cam_frame)
+        if rays is None:
+            return False
+        o, d = rays[0], rays[1][0]
         plane_z = self.ball_r - self.base_h              # ball-centre height in the base frame
         if d[2] >= -1e-4:
             return False
@@ -262,9 +296,81 @@ class BallDetector(Node):
         self.pub_map.publish(pm)
         return True
 
+    # ----------------------------------------------------------------- field lines
+    def _lines(self, rgb, cam_frame):
+        import cv2
+        g = lambda n: self.get_parameter(n).value  # noqa: E731
+        h, w = rgb.shape[:2]
+        step = 4                                            # every 4th pixel: plenty for 1.5 cm wide lines
+        small = np.ascontiguousarray(rgb[::step, ::step])
+        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+        white = (hsv[:, :, 1] <= g('line_s_max')) & (hsv[:, :, 2] >= g('line_v_min'))
+        vs, us = np.nonzero(white)
+        now = self.get_clock().now()
+        tnow = now.nanoseconds * 1e-9
+        try:
+            t_ob = self.tf_buffer.lookup_transform('odom', self.base_frame, rclpy.time.Time())
+        except tf2_ros.TransformException:
+            return
+        boundary_px = other_px = np.zeros((0, 2))
+        if len(us):
+            uv = np.stack([us * step + step / 2, vs * step + step / 2], axis=1).astype(float)
+            rays = self._rays(uv, cam_frame)
+            if rays is None:
+                return
+            o, d = rays
+            down = d[:, 2] < -1e-4                          # below the horizon only
+            sc = np.where(down, (-self.base_h - o[2]) / np.where(down, d[:, 2], -1.0), -1.0)
+            p = o[None, :2] + sc[:, None] * d[:, :2]
+            ok = down & (sc > 0) & (np.hypot(p[:, 0], p[:, 1]) < g('line_range'))
+            p, uv = p[ok], uv[ok]
+            try:
+                t_mb = self.tf_buffer.lookup_transform('map', self.base_frame, rclpy.time.Time())
+            except tf2_ros.TransformException:
+                t_mb = None
+            if t_mb is not None and len(p):
+                yaw = yaw_from_quat(t_mb.transform.rotation)
+                c, s = math.cos(yaw), math.sin(yaw)
+                mx = t_mb.transform.translation.x + c * p[:, 0] - s * p[:, 1]
+                my = t_mb.transform.translation.y + s * p[:, 0] + c * p[:, 1]
+                L2, W2, G2 = g('field_length') / 2, g('field_width') / 2, g('goal_width') / 2
+                band = g('boundary_band')
+                inside = (np.abs(mx) < L2 + band) & (np.abs(my) < W2 + band)      # the wall base is beyond
+                end = (L2 - np.abs(mx) < band) & (np.abs(my) > G2 + 0.03)        # not the goal mouth
+                side = W2 - np.abs(my) < band
+                isb = inside & (end | side)
+                boundary_px, other_px = uv[isb], uv[~isb]
+                # remember the boundary points in odom (robot-fixed memory survives the blind spot)
+                yo = yaw_from_quat(t_ob.transform.rotation)
+                co, so = math.cos(yo), math.sin(yo)
+                ox = t_ob.transform.translation.x + co * p[isb, 0] - so * p[isb, 1]
+                oy = t_ob.transform.translation.y + so * p[isb, 0] + co * p[isb, 1]
+                for x, y in zip(ox, oy):
+                    self.line_mem[(int(round(x / 0.02)), int(round(y / 0.02)))] = (x, y, tnow)
+        self.line_px = (boundary_px, other_px)
+        # forget old points, publish the rest in the current base frame
+        keep = g('line_memory')
+        self.line_mem = {k: v for k, v in self.line_mem.items() if tnow - v[2] < keep}
+        yo = yaw_from_quat(t_ob.transform.rotation)
+        co, so = math.cos(yo), math.sin(yo)
+        bx, by = t_ob.transform.translation.x, t_ob.transform.translation.y
+        out = PoseArray()
+        out.header.frame_id, out.header.stamp = self.base_frame, now.to_msg()
+        for x, y, _ in self.line_mem.values():
+            dx, dy = x - bx, y - by
+            q = Pose()
+            q.position.x, q.position.y = co * dx + so * dy, -so * dx + co * dy
+            if q.position.x ** 2 + q.position.y ** 2 < 0.36:            # 0.6 m around the robot is enough
+                out.poses.append(q)
+        self.pub_line.publish(out)
+
     def _debug(self, rgb, det, msg):
         import cv2
         img = np.ascontiguousarray(rgb).copy()
+        if self.line_px is not None:                        # boundary line red, other lines green
+            for pts, col in ((self.line_px[1], (0, 200, 0)), (self.line_px[0], (255, 0, 0))):
+                for u, v in pts.astype(int):
+                    cv2.circle(img, (int(u), int(v)), 2, col, -1)
         if det is not None:
             cx, cy, w, h, conf = det
             cv2.rectangle(img, (int(cx - w / 2), int(cy - h / 2)), (int(cx + w / 2), int(cy + h / 2)),

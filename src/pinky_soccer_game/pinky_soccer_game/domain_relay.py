@@ -41,8 +41,8 @@ def main():
     home, home_ctx = make_node(args.from_domain, 'game_relay_home')
     other, other_ctx = make_node(args.to_domain, 'game_relay_other')
 
-    from geometry_msgs.msg import PointStamped
-    types = {'String': String, 'PointStamped': PointStamped}
+    from geometry_msgs.msg import PointStamped, PoseWithCovarianceStamped
+    types = {'String': String, 'PointStamped': PointStamped, 'PoseWithCovarianceStamped': PoseWithCovarianceStamped}
 
     def link(src, dst, topic_src, topic_dst=None, kind='String'):
         pub = dst.create_publisher(types[kind], topic_dst or topic_src, 10)
@@ -50,6 +50,8 @@ def main():
 
     for t in FORWARD:
         link(home, other, t)
+    # sim referee: blue's AMCL reset after it lifted the blue robot out of a goal (sim_duel: namespaced /blue)
+    link(home, other, '/blue/initialpose', kind='PoseWithCovarianceStamped')
     for t_src, t_dst, kind in BACKWARD:
         link(other, home, t_src, t_dst, kind)
     home.get_logger().info(f'relaying {FORWARD} domain {args.from_domain} -> {args.to_domain}, '

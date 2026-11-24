@@ -75,6 +75,7 @@ def launch_setup(context):
             Node(package='pinky_soccer_vision', executable='ball_detector', name='ball_detector', output='log',
                  parameters=[{'use_sim_time': False, 'backend': 'hsv', 'compressed': True,
                               'process_every_n': 1, 'fallback_hfov_deg': float(v('camera_hfov')),
+                              'field_length': L, 'field_width': W, 'goal_width': G,   # boundary line
                               # the URDF says 8 deg down; the real cameras look less down -> correction per
                               # robot (negative = up): camera_calib window result, else cam_pitch_<team>
                               **cam_cfg(team)}]),

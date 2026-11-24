@@ -42,6 +42,8 @@
 
 → 카메라 각도가 1°만 틀려도 먼 공의 거리가 크게 틀립니다. 그래서 보정 창이 필요합니다.
 
+**흰 라인 (라인 가드):** 같은 노드가 흰 픽셀(채도 낮고 밝음)도 바닥으로 투영합니다. 맵 좌표로 바꿨을 때 경기장 가장자리에서 7 cm 안이면 바깥 라인으로 봅니다(골문 앞 제외). 바로 앞은 카메라 사각지대라 odom 좌표로 4초 기억해서 `/line/boundary`(로봇 기준 점들)로 보냅니다. striker는 모든 속도 명령을 내보내기 전에 이 점들이 로봇이 지나갈 띠 안에 있으면 직진·후진을 0으로 만듭니다(`_line_guard`).
+
 ### 3-2. 위치 추정 — AMCL ([`nav.launch.py`](../src/pinky_soccer_nav/launch/nav.launch.py))
 - 경기장 맵은 치수 파일에서 자동으로 만듭니다(`pinky_soccer_sim/field.py`, `generate_map.py`).
 - AMCL은 "내가 여기 있다면 라이다에 벽이 이렇게 보여야 한다"는 후보(파티클)를 많이 뿌리고, 실제 라이다와 잘 맞는 후보만 남기는 방식(파티클 필터)입니다.
@@ -58,7 +60,9 @@
 | ORBIT / APPROACH | 공 "뒤쪽"(골대 반대편)으로 돌아가기. 공에 가까울수록 도는 반지름을 줄임 |
 | DRIBBLE | 공을 앞면으로 밀며 조준점으로. 벽에 붙은 공은 벽을 따라 조준 |
 | SHOOT | 골 가까이에서 정렬되면 짧게 돌진 |
-| CELEBRATE | 골 뒤 자기 진영 가운데에서 5바퀴 회전 |
+| CELEBRATE | 골 뒤 자기 진영 가운데에서 3바퀴 회전 |
+| CONCEDE | 실점 뒤: 중앙선 근처로 비켰다가 시작 위치로 |
+| SCORER_WAIT | 골 뒤 재시작에서 직전 득점 로봇이 3초 대기 |
 
 - 상대 회피: 라이다 점 중 맵의 벽으로 설명되지 않는 점을 상대로 보고, 가까우면 감속하며 옆으로 돕니다([`avoidance.py`](../src/pinky_soccer_game/pinky_soccer_game/avoidance.py)).
 - 튜닝 값은 [`common.py`](../src/pinky_soccer_bringup/pinky_soccer_bringup/common.py)의 `solo_striker_params`에 모여 있습니다.

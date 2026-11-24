@@ -40,7 +40,7 @@ class RealReferee(Node):
         P('win_score', 5)
         P('duel', False)                # two real robots: blue's state / ball come relayed from its domain
                                         # (/blue/game/state, /blue/ball/position_map - domain_relay)
-        P('celebrate_timeout', 60.0)    # s max for the celebration (drive + 5 turns)
+        P('celebrate_timeout', 60.0)    # s max for the celebration (drive + 3 turns)
         P('goal_pause', 2.0)            # s standing still after a goal
         P('ball_still_time', 2.0)       # s the placed ball must lie still before the kickoff
         P('ball_still_tol', 0.04)       # m
@@ -58,6 +58,10 @@ class RealReferee(Node):
         P('corner_zone', 0.22)          # m from both walls = in the corner (the robot cannot get behind it)
         P('corner_time', 1.0)           # s
         P('corner_pause', 1.5)          # s robot stands (sound) before going back
+        P('wall_zone', 0.07)            # m: ball this close to the boundary line (or beyond; robots must not
+                                        # cross the line - goal mouths excepted) ...
+        P('wall_stuck_time', 10.0)      # ... lying still this long -> ask for the ball on the centre spot
+                                        # (robots play on: nobody can get behind a ball on the wall)
         self.L = self.get_parameter('field_length').value
         self.W = self.get_parameter('field_width').value
         self.G = self.get_parameter('goal_width').value
@@ -68,6 +72,9 @@ class RealReferee(Node):
         self.game_t0 = time.time()
         self.ball = None                # (x, y, t)
         self.still_ref = None           # (x, y, t) ball position where it started lying still
+        self.still_src = {}             # per camera: (x, y, t) - two cameras see the ball a few cm apart,
+                                        # so mixing them would never count as 'lying still'
+        self.wait_note_t = 0.0
         self.robot_state, self.robot_state_t = '', 0.0
         self.asked_ball = False
         self.ball_placed = False
@@ -187,9 +194,21 @@ class RealReferee(Node):
         if abs(y) < self.G / 2 and self.L / 2 + 0.005 < abs(x) < self.L / 2 + 0.12:
             self.goal_hits.append(('YELLOW' if x > 0 else 'BLUE', source, now))
         self.ball = (x, y, now)
-        ref = self.still_ref
-        if ref is None or math.hypot(x - ref[0], y - ref[1]) > self.get_parameter('ball_still_tol').value:
-            self.still_ref = (x, y, now)
+        ref = self.still_src.get(source)
+        if ref is None or now - ref[3] > 0.6 or \
+                math.hypot(x - ref[0], y - ref[1]) > self.get_parameter('ball_still_tol').value:
+            self.still_src[source] = (x, y, now, now)       # (x, y, still since, last seen)
+        else:
+            self.still_src[source] = (ref[0], ref[1], ref[2], now)
+        self.still_ref = self._still_ball(now)
+
+    def _still_ball(self, now):
+        """The camera estimate that has been lying still longest (and is fresh): (x, y, still since) or None."""
+        best = None
+        for x, y, since, seen in self.still_src.values():
+            if now - seen < 0.6 and (best is None or since < best[2]):
+                best = (x, y, since)
+        return best
 
     def _amcl(self, msg):
         p = msg.pose.pose
@@ -255,6 +274,7 @@ class RealReferee(Node):
     # ------------------------------------------------------------------ flow
     def _place_ball(self, x, y):
         self.still_ref = None
+        self.still_src = {}
         z = self.get_parameter('ball_radius').value + 0.003
         if self.get_parameter('sim_backend').value == 'mujoco':       # mujoco_soccer: /sim/set_pose
             from geometry_msgs.msg import PoseStamped
@@ -305,7 +325,7 @@ class RealReferee(Node):
             self.pub_fx.publish(String(data='GOAL'))
             self.finish_after_goal = None
             self._set_phase('GOAL')
-            self._event(f'{line}  -  세레모니(제자리 5바퀴) 후 출발 위치로, 공을 가운데에 놓아 주세요')
+            self._event(f'{line}  -  세레모니(제자리 3바퀴) 후 출발 위치로, 공을 가운데에 놓아 주세요')
 
     def tick(self):
         now = time.time()
@@ -326,14 +346,34 @@ class RealReferee(Node):
                 self.ball_placed = True
                 self._place_ball(0.0, 0.0)
                 self._event('(시뮬) 공을 가운데에 놓았습니다')
+            ref = self._still_ball(now)
+            if ref is not None:
+                b = (ref[0], ref[1], now)                 # the steady camera's estimate of the ball
             centred = seen and math.hypot(b[0], b[1]) < self.get_parameter('centre_tol').value
-            still = seen and self.still_ref is not None and \
-                now - self.still_ref[2] > self.get_parameter('ball_still_time').value
+            still = seen and ref is not None and now - ref[2] > self.get_parameter('ball_still_time').value
+            if now - self.phase_t0 > 8.0 and now - self.wait_note_t > 8.0 and not (ready and centred and still):
+                self.wait_note_t = now                    # say what the auto-start is still waiting for
+                st = {t: self.states[t][0] if now - self.states[t][1] < 2.0 else '(신호 없음)'
+                      for t in (('YELLOW', 'BLUE') if self.duel else ('YELLOW',))}
+                why = [f'{"노랑" if t == "YELLOW" else "파랑"} {v}' for t, v in st.items() if v != 'READY']
+                if not seen:
+                    why.append('공 안 보임')
+                elif not centred:
+                    why.append(f'공이 가운데 아님 ({b[0]:+.2f}, {b[1]:+.2f})')
+                elif not still:
+                    why.append('공이 아직 흔들림')
+                text = '자동 시작 대기: ' + ', '.join(why)
+                if text != getattr(self, 'last_wait_text', ''):
+                    self.last_wait_text = text
+                    self._event(text)                     # shown in the match window
+                else:
+                    self.get_logger().info(text)
             if ready and centred and still:
                 self.ball_at_mouth_t = None
                 self.corner_since = None
                 self._set_phase('START')
-                self._event('킥오프 - 노랑 출발!')
+                self._event('경기 시작 - 가운데 공, 동시 출발 (직전 득점 팀은 3초 뒤)' if self.goals else
+                            '경기 시작 - 가운데 공, 동시 출발')
             elif ready and not centred and still and self.asked_ball != 'off_centre':
                 self.asked_ball = 'off_centre'
                 self._event(f'공이 가운데가 아닙니다 ({b[0]:.2f}, {b[1]:.2f}) - 가운데에 놓으면 자동 시작 '
@@ -356,6 +396,15 @@ class RealReferee(Node):
             if scorer is not None:
                 self._goal(scorer, '공이 골라인 통과' if (scorer == 'YELLOW' or self.duel) else '자기 골대에 들어감')
                 return
+            if seen and abs(b[0]) > self.L / 2 + 0.01 and abs(b[1]) >= self.G / 2:
+                # out over the goal line beside the goal: no stop, the robots play on - only the ball goes
+                # back to the centre spot (a person puts it there)
+                self.corner_since = None
+                if now - self.last_out > 5.0:
+                    self.last_out = now
+                    self.pub_fx.publish(String(data='CORNER'))
+                    self._event('공이 골라인 밖으로 나감 - 로봇은 그대로, 공만 가운데에 놓아 주세요')
+                return
             if seen:
                 margin = self.get_parameter('mouth_margin').value
                 mouth = abs(b[1]) < self.G / 2 - 0.02
@@ -367,6 +416,14 @@ class RealReferee(Node):
                     self.ball_at_mouth_t, self.mouth_team = now, 'BLUE'
                 else:
                     self.ball_at_mouth_t = None
+                ref = self._still_ball(now)
+                wz = self.get_parameter('wall_zone').value
+                on_wall = ((self.L / 2 - abs(b[0]) < wz and abs(b[1]) > self.G / 2) or self.W / 2 - abs(b[1]) < wz)
+                if on_wall and ref is not None and now - ref[2] > self.get_parameter('wall_stuck_time').value \
+                        and now - self.last_out > 10.0:
+                    self.last_out = now
+                    self.pub_fx.publish(String(data='CORNER'))
+                    self._event('공이 라인에 붙어 안 움직임 - 로봇은 그대로, 공만 가운데에 놓아 주세요')
                 zone = self.get_parameter('corner_zone').value
                 in_corner = abs(b[0]) > self.L / 2 + self.strip - zone and abs(b[1]) > self.W / 2 + self.strip - zone
                 if not in_corner:

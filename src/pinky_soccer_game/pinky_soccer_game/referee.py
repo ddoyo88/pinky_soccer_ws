@@ -51,13 +51,17 @@ class Referee(Node):
         self.declare_parameter('field_width', FIELD_W)
         self.declare_parameter('goal_width', FIELD_G)
         self.declare_parameter('world', 'soccer')
-        self.declare_parameter('celebrate_timeout', 60.0)    # s max for the scorer's celebration (drive + 5 turns ~40 s)
+        self.declare_parameter('celebrate_timeout', 60.0)    # s max for the scorer's celebration (drive + 3 turns)
         self.declare_parameter('sim_backend', 'gz')          # gz | mujoco (how the ball / a robot is moved)
         self.declare_parameter('yellow_initialpose_topic', '/initialpose')   # duel: /yellow/initialpose
         self.declare_parameter('ball_radius', 0.02135)
         self.declare_parameter('stuck_timeout', 0.0)       # s without ball movement -> centre; 0 = off
                                                            # (match rule: a ball lying alone is left alone)
         self.declare_parameter('wedge_timeout', 5.0)       # s, ball stuck together with a robot -> centre
+        self.declare_parameter('wall_zone', 0.06)          # m: ball this close to the boundary LINE (or beyond
+                                                           # it; the robots must not cross the line) ...
+        self.declare_parameter('wall_stuck_time', 10.0)    # ... and not moving this long -> centre (robots
+                                                           # cannot get behind a ball lying on the wall)
         self.declare_parameter('corner_zone', 0.20)        # m from both walls = in a corner
         self.declare_parameter('wedge_wall_dist', 0.15)    # ball centre this close to a wall = 'at the wall'
         self.declare_parameter('wedge_robot_dist', 0.13)   # robot centre this close to the ball = pressed on it
@@ -79,6 +83,8 @@ class Referee(Node):
         self.declare_parameter('start_delay', 1.5)         # s after the kickoff ball is placed -> START
         self.declare_parameter('ready_pos_tol', 0.13)      # start pose tolerance (ground truth)
         self.declare_parameter('ready_yaw_tol', 0.30)
+        self.declare_parameter('require_robot_ready', True)   # like the real referee: the strikers must
+                                                               # also REPORT READY (their own localisation)
         self.declare_parameter('prepare_timeout', 40.0)    # s; start anyway if a robot cannot get ready
         self.declare_parameter('jam_timeout', 3.0)         # s a robot sits inside a goal mouth -> lifted out
         # match UI: '경기 준비' puts the ball on the centre spot (in the real match a person does this)
@@ -134,6 +140,8 @@ class Referee(Node):
         self.pub_kickoff = self.create_publisher(String, '/game/kickoff', 10)
         self.pub_initialpose = self.create_publisher(
             PoseWithCovarianceStamped, self.get_parameter('yellow_initialpose_topic').value, 10)
+        # blue lives in its own domain: domain_relay forwards /blue/initialpose there
+        self.pub_initialpose_blue = self.create_publisher(PoseWithCovarianceStamped, '/blue/initialpose', 10)
         self.create_timer(0.1, self.tick)
         if self.match_control:
             self.create_timer(0.2, self._publish_phase)
@@ -232,8 +240,16 @@ class Referee(Node):
         y, b = self.tracker.get('pinky_yellow'), self.tracker.get('pinky_blue')
         if y is None or b is None:
             return False
-        return (math.hypot(y[0] + start, y[1]) < tol and abs(_wrap(y[3])) < ytol
-                and math.hypot(b[0] - start, b[1]) < tol and abs(_wrap(b[3] - math.pi)) < ytol)
+        if not (math.hypot(y[0] + start, y[1]) < tol and abs(_wrap(y[3])) < ytol
+                and math.hypot(b[0] - start, b[1]) < tol and abs(_wrap(b[3] - math.pi)) < ytol):
+            return False
+        if self.get_parameter('require_robot_ready').value:
+            now = time.time()
+            for team in ('YELLOW', 'BLUE'):
+                st = self.robot_state.get(team)
+                if st is None or st[0] != 'READY' or now - st[1] > 2.0:
+                    return False
+        return True
 
     def _tick_prepare(self, now):
         timeout = now - self.phase_t0 > self.get_parameter('prepare_timeout').value
@@ -298,7 +314,7 @@ class Referee(Node):
             self._event(f'{line}  -  {name} 세레모니 후 경기 종료')
         else:
             self.finish_after_goal = None
-            self._event(f'{line}  -  {name} 세레모니 (제자리 5바퀴), 그 다음 가운데에서 다시 시작')
+            self._event(f'{line}  -  {name} 세레모니 (제자리 3바퀴), 그 다음 가운데에서 다시 시작')
 
     def _celebration_over(self, now):
         """The scorer reported CELEBRATE_DONE (after at least goal_pause), or the timeout ran out."""
@@ -328,10 +344,11 @@ class Referee(Node):
 
     def _check_goal_jam(self, now):
         """The crossbar is 7 cm high: a robot whose nose went under it cannot back out by itself.
-        Like a person on the real field, lift it out to just in front of that goal, facing the field."""
+        Like a person on the real field, lift it out - onto its own start pose (in front of its own goal,
+        facing the field): just in front of the goal it is stuck in would box it in behind the other robot."""
         for name in ('pinky_yellow', 'pinky_blue'):
             p = self.tracker.get(name)
-            inside = p is not None and abs(p[0]) > self.L / 2 - 0.06 and abs(p[1]) < self.G / 2 + 0.04
+            inside = p is not None and abs(p[0]) > self.L / 2 - 0.08 and abs(p[1]) < self.G / 2 + 0.06
             if not inside:
                 self.jam_since.pop(name, None)
                 continue
@@ -339,19 +356,24 @@ class Referee(Node):
             if now - first < self.get_parameter('jam_timeout').value:
                 continue
             self.jam_since.pop(name, None)
-            sign = 1.0 if p[0] > 0 else -1.0
-            x, y, yaw = sign * (self.L / 2 - 0.22), p[1], (math.pi if sign > 0 else 0.0)
-            self._set_model_pose(name, x, y, 0.01, yaw)
-            if name == 'pinky_yellow':                  # AMCL would keep the old pose: tell it where it is
-                m = PoseWithCovarianceStamped()
-                m.header.frame_id = 'map'
-                m.header.stamp = self.get_clock().now().to_msg()
-                m.pose.pose.position.x, m.pose.pose.position.y = x, y
-                m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
-                m.pose.covariance[0] = m.pose.covariance[7] = 0.0025
-                m.pose.covariance[35] = 0.01
-                threading.Timer(0.6, lambda msg=m: self.pub_initialpose.publish(msg)).start()
-            self._event(f'{"노랑" if name == "pinky_yellow" else "파랑"} 로봇이 골대에 끼어 앞으로 꺼냄')
+            start = self.L / 2 - self.get_parameter('ready_offset').value
+            x, y, yaw = (-start, 0.0, 0.0) if name == 'pinky_yellow' else (start, 0.0, math.pi)
+            # MuJoCo: drop it from the spawn height (3 cm) - at 1 cm the wheels sink into the floor and the
+            # robot stays tilted (lidar on the floor -> AMCL lost, barely drives)
+            z = 0.03 if self.get_parameter('sim_backend').value == 'mujoco' else 0.01
+            self._set_model_pose(name, x, y, z, yaw)
+            # AMCL would keep the old pose: tell it where it is
+            pub = self.pub_initialpose if name == 'pinky_yellow' else self.pub_initialpose_blue
+            m = PoseWithCovarianceStamped()
+            m.header.frame_id = 'map'
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.pose.pose.position.x, m.pose.pose.position.y = x, y
+            m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+            m.pose.covariance[0] = m.pose.covariance[7] = 0.0025
+            m.pose.covariance[35] = 0.01
+            for delay in (0.8, 1.6):                   # after the simulator has moved it (twice: sure)
+                threading.Timer(delay, lambda msg=m, p=pub: p.publish(msg)).start()
+            self._event(f'{"노랑" if name == "pinky_yellow" else "파랑"} 로봇이 골대에 끼어 출발 위치로 옮김')
 
     def _set_model_pose(self, name, x, y, z, yaw):
         """Move a model: Gazebo set_pose service, or MuJoCo /sim/set_pose (mujoco_soccer)."""
@@ -415,7 +437,7 @@ class Referee(Node):
         now = time.time()
         if self.match_control:
             self.pub_kickoff.publish(String(data=self.kickoff))
-            if self.match_phase in ('PREPARE', 'START'):
+            if self.match_phase in ('PREPARE', 'START', 'GOAL'):   # GOAL: the scorer may be stuck in there
                 self._check_goal_jam(now)
             if self.match_phase == 'PREPARE':
                 self._tick_prepare(now)
@@ -485,7 +507,14 @@ class Referee(Node):
             else:
                 still = now - self.last_move_t
                 wedged = self._wedged(bx, by)
-                if (wedged and still > self.get_parameter('wedge_timeout').value) \
+                zone = self.get_parameter('wall_zone').value
+                on_wall = ((self.L / 2 - abs(bx) < zone and abs(by) > self.G / 2) or   # not the goal mouth
+                           self.W / 2 - abs(by) < zone)
+                if on_wall and not wedged and still > self.get_parameter('wall_stuck_time').value:
+                    if self._centre_ball('공이 라인에 붙어 안 움직임 -> 공만 중앙으로, 경기 계속'):
+                        self.last_ball = None
+                        self.last_move_t = now
+                elif (wedged and still > self.get_parameter('wedge_timeout').value) \
                         or 0 < self.get_parameter('stuck_timeout').value < still:
                     if self._centre_ball('공이 모서리에 걸려 못 빠져나옴 -> 중앙으로'):
                         self.last_ball = None

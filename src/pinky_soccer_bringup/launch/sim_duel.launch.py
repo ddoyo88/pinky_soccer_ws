@@ -129,7 +129,8 @@ def _robot(context, team, domain, gz_prefix, pose, L, W, G, strip, v, sim='gz'):
                  'initial_x': str(x), 'initial_y': str(y), 'initial_yaw': str(yaw)}),
         Node(package='pinky_soccer_vision', executable='ball_detector', namespace=ns, name='ball_detector',
              output='log', remappings=TF_REMAP,
-             parameters=[{'backend': v('backend'), 'model_path': '', 'process_every_n': 1}, SIM]),
+             parameters=[{'backend': v('backend'), 'model_path': '', 'process_every_n': 1,
+                          'field_length': L, 'field_width': W, 'goal_width': G}, SIM]),
         Node(package='pinky_soccer_game', executable='striker', namespace=ns, name='striker', output='screen',
              remappings=TF_REMAP, parameters=[striker]),
     ]
