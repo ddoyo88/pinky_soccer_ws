@@ -44,7 +44,7 @@ for team in ('yellow', 'blue'):
     c = states[team]
     print(f'{team}: ball search {c["SEARCH"] + c["LOOK_BACK"] + c["ROAM"]} (turn to last seen {c["LOOK_TOWARD"]}, near back-up {c["NEAR_BACKUP"]}), line-escape {c["RL_ESCAPE"]}, '
           f'backoff {c["BACKOFF"] + c["ESCAPE"]}, concede-centre {c["CONCEDE_CENTRE"]}')
-print(f'robot guard stops (log lines): {len(re.findall(r"in the way: stop", sim))}, '
+print(f"pinch back-offs: {len(re.findall(r'squeezed between', sim))}"); print(f'robot guard stops (log lines): {len(re.findall(r"in the way: stop", sim))}, '
       f'right-of-way changes: {len(re.findall(r"right of way at the ball", sim))}, '
       f'line-guard stops: {len(re.findall(r"boundary line (ahead|behind|\(map\) in the way)", sim))}, '
       f'RL idle -> rules: {len(re.findall(r"RL policy idle", sim))}')

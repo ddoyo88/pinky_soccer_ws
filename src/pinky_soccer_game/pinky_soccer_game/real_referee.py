@@ -58,7 +58,9 @@ class RealReferee(Node):
         P('corner_zone', 0.22)          # m from both walls = in the corner (the robot cannot get behind it)
         P('corner_time', 1.0)           # s
         P('corner_pause', 1.5)          # s robot stands (sound) before going back
-        P('wall_zone', 0.07)            # m: ball this close to the boundary line (or beyond; robots must not
+        P('auto_ball_reset', False)     # false: the person refereeing decides - only 'ball out over a goal line'
+                                        # is announced (true: also line / corner / 10 s standstill calls)
+        P('wall_zone', 0.08)            # m: ball this close to the boundary line (or beyond; robots must not
                                         # cross the line - goal mouths excepted) ...
         P('wall_stuck_time', 3.0)       # ... lying still this long -> ask for the ball on the centre spot
         P('stuck_time', 10.0)           # ball not moving at all this long anywhere (deadlock) -> same
@@ -391,7 +393,8 @@ class RealReferee(Node):
                 self.armed = True
             if not self.armed:
                 return
-            if seen and self.get_parameter('place_ball_sim').value and abs(b[0]) > self.L / 2 + 0.01 \
+            if seen and self.get_parameter('place_ball_sim').value and self.get_parameter('auto_ball_reset').value \
+                    and abs(b[0]) > self.L / 2 + 0.01 \
                     and abs(b[1]) >= self.G / 2 and now - self.last_out > 2.0:
                 self._place_ball(0.0, 0.0)                      # no random spots: back to the centre
                 self.last_out = now
@@ -421,9 +424,11 @@ class RealReferee(Node):
                     self.ball_at_mouth_t, self.mouth_team = now, 'BLUE'
                 else:
                     self.ball_at_mouth_t = None
+                if not self.get_parameter('auto_ball_reset').value:
+                    return                                  # ball stays where it is: the referee's call
                 ref = self._still_ball(now)
                 wz = self.get_parameter('wall_zone').value
-                on_wall = ((self.L / 2 - abs(b[0]) < wz + 0.02 and abs(b[1]) > self.G / 2) or   # end line incl.
+                on_wall = ((self.L / 2 - abs(b[0]) < wz + 0.05 and abs(b[1]) > self.G / 2 - 0.05) or   # end line incl.
                            self.W / 2 - abs(b[1]) < wz)                                     # next to a post
                 stuck = ref is not None and now - ref[2] > self.get_parameter('stuck_time').value
                 if stuck and not on_wall and now - self.last_out > 10.0:

@@ -59,7 +59,11 @@ class Referee(Node):
                                                            # stuck next to it) -> centre; 0 = off
                                                            # (match rule: a ball lying alone is left alone)
         self.declare_parameter('wedge_timeout', 5.0)       # s, ball stuck together with a robot -> centre
-        self.declare_parameter('wall_zone', 0.06)          # m: ball this close to the boundary LINE (or beyond
+        # the person refereeing decides: the ball is never moved by itself; only a ball over a goal line beside
+        # the goal is announced, and the match window's "공 가운데로" button puts it back (true: the old automatic
+        # resets - line / corner / 10 s standstill / out - for unattended test runs)
+        self.declare_parameter('auto_ball_reset', False)
+        self.declare_parameter('wall_zone', 0.08)          # m: ball this close to the boundary LINE (or beyond
                                                            # it; the robots must not cross the line) ...
         self.declare_parameter('wall_stuck_time', 3.0)     # ... and not moving this long -> centre (robots
                                                            # cannot get behind a ball lying on the wall)
@@ -360,7 +364,7 @@ class Referee(Node):
         facing the field): just in front of the goal it is stuck in would box it in behind the other robot."""
         for name in ('pinky_yellow', 'pinky_blue'):
             p = self.tracker.get(name)
-            inside = p is not None and abs(p[0]) > self.L / 2 - 0.08 and abs(p[1]) < self.G / 2 + 0.06
+            inside = p is not None and abs(p[0]) > self.L / 2 - 0.04 and abs(p[1]) < self.G / 2 + 0.06   # (0.08 lifted keepers standing in front of their goal, final5i)
             if not inside:
                 self.jam_since.pop(name, None)
                 continue
@@ -388,8 +392,14 @@ class Referee(Node):
             m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
             m.pose.covariance[0] = m.pose.covariance[7] = 0.0025
             m.pose.covariance[35] = 0.01
+            def send(msg=m, p=pub):
+                # stamp NOW: AMCL moves an initial pose by the odometry since its stamp - with the rescue-time
+                # stamp that included the teleport, so AMCL started 2 rad off and flipped to the mirrored
+                # field (r8s2: 1.4 m error for the rest of the set)
+                msg.header.stamp = self.get_clock().now().to_msg()
+                p.publish(msg)
             for delay in (0.8, 1.6):                   # after the simulator has moved it (twice: sure)
-                threading.Timer(delay, lambda msg=m, p=pub: p.publish(msg)).start()
+                threading.Timer(delay, send).start()
             self._event(f'{"노랑" if name == "pinky_yellow" else "파랑"} 로봇이 골대에 끼어 출발 위치로 옮김')
 
     def _set_model_pose(self, name, x, y, z, yaw):
@@ -516,6 +526,21 @@ class Referee(Node):
             self._event(f'GOAL! BLUE scores ->  YELLOW {self.yellow} - {self.blue} BLUE')
         else:
             # behind a goal line but beside the goal: bring it back to the centre and play on
+            if not self.get_parameter('auto_ball_reset').value:
+                out = (abs(bx) > self.L / 2 + 0.01 and not in_mouth) or abs(by) > self.W / 2 + 0.01
+                if out and not getattr(self, 'out_called', False):
+                    where = '골라인' if abs(bx) > self.L / 2 + 0.01 else '사이드라인'
+                    self._event(f'공이 {where} 밖으로 나감 - 로봇은 대기, 심판이 "공 가운데로" 버튼으로 옮겨 주세요')
+                self.out_called = out
+                # ball lying on a line where no robot can reach it without crossing the line: only an
+                # announcement - the person refereeing decides (button), the ball is not moved
+                if self.last_ball is None or math.hypot(bx - self.last_ball[0], by - self.last_ball[1]) > 0.02:
+                    self.last_ball, self.last_move_t, self.line_called = (bx, by), now, False
+                elif not out and not getattr(self, 'line_called', False) and now - self.last_move_t > 5.0 and \
+                        (self.L / 2 - abs(bx) < 0.06 and abs(by) > self.G / 2 - 0.03 or self.W / 2 - abs(by) < 0.06):
+                    self.line_called = True
+                    self._event('공이 라인에 붙어 로봇이 꺼낼 수 없음 - 심판 판단: "공 가운데로" 버튼')
+                return
             if abs(bx) > self.L / 2 + 0.01 and not in_mouth:
                 self.out_since = self.out_since or now
                 if now - self.out_since > self.get_parameter('out_timeout').value:
@@ -532,8 +557,8 @@ class Referee(Node):
                 still = now - self.last_move_t
                 wedged = self._wedged(bx, by)
                 zone = self.get_parameter('wall_zone').value
-                on_wall = ((self.L / 2 - abs(bx) < zone + 0.03 and abs(by) > self.G / 2) or   # end line incl.
-                           self.W / 2 - abs(by) < zone)                                 # next to a post
+                on_wall = ((self.L / 2 - abs(bx) < zone + 0.05 and abs(by) > self.G / 2 - 0.05) or   # end line incl.
+                           self.W / 2 - abs(by) < zone)          # side line; end line up to 5 cm inside a post (r7s2)
                 if on_wall and not wedged and still > self.get_parameter('wall_stuck_time').value:
                     if self._centre_ball('공이 라인에 붙어 안 움직임 -> 공만 중앙으로, 경기 계속'):
                         self.last_ball = None

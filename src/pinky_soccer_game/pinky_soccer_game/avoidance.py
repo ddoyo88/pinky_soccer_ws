@@ -151,7 +151,12 @@ def goal_mouth_guard(me, v, half_len, goal_w, nose=0.09, margin=0.06):
     d = nose if v > 0 else -0.08                    # leading end: bumper nose, or the rear when reversing
     px, py = me[0] + d * math.cos(me[2]), me[1] + d * math.sin(me[2])
     outward = math.copysign(1.0, px) * math.cos(me[2]) * math.copysign(1.0, v) > 0
-    if outward and abs(py) < goal_w / 2 + margin and abs(px) > half_len - 0.005:
+    # the nose may reach 3 cm past the line: a slow push must carry the ball over it (goal = ball centre
+    # 1 cm past the line; stopping at the line left the ball lying on it, r6s2); at speed the braking nose
+    # passed in by the caller still stops it well before the crossbar
+    # (forward only - reversing / giving way the rear stops 2 cm short of the line: blue backed into its own
+    # goal and got stuck, final5f)
+    if outward and abs(py) < goal_w / 2 + margin and abs(px) > half_len + (0.03 if v > 0 else -0.02):
         return 0.0
     return v
 

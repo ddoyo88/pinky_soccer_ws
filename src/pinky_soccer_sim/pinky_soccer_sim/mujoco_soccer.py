@@ -64,7 +64,7 @@ def quat_yaw(q):
 
 
 # ------------------------------------------------------------------------------------------------ model
-def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.0003, markings=True, hull_verts=0, visuals=True):
+def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.00022, markings=True, hull_verts=0, visuals=True):
     """Field + ball + yellow/blue Pinky -> compiled MjModel.  markings=False leaves out the painted lines (visual
     only).  hull_verts > 0 caps the collision hulls of the robot meshes (up to 11k vertices: the physics of
     several processes then fights over the CPU cache and does not scale - RL training uses 64).  visuals=False
@@ -157,6 +157,12 @@ def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.0003, markings=True
     for team in SCREEN_IMAGES if visuals else ():
         _add_screen(spec, team, compiled)
     model = spec.compile()
+    # detailed robot meshes (visual only, 742k vertices) -> geom group 4: the viewer draws them, the robot
+    # cameras skip them (a camera frame took 22 ms with them, 9 ms without; field lines stay in group 2)
+    for i in range(model.ngeom):
+        if model.geom_type[i] == mujoco.mjtGeom.mjGEOM_MESH and model.geom_group[i] == 2 and \
+                model.geom_contype[i] == 0 and model.geom_conaffinity[i] == 0:
+            model.geom_group[i] = 4
     # robot collision shapes: collide with each other too, and sit in a per-team group for the lidars
     for i in range(model.ngeom):
         name = model.geom(i).name
@@ -438,10 +444,14 @@ class SoccerSim:
         self._apply_poses()
         limit = self.s['motors'].get('wheel_accel', 1e9) * self.model.opt.timestep
         targets = {t: r.wheel_targets() for t, r in self.robots.items()}
+        T = self.prof = getattr(self, 'prof', {})
+        t0 = time.perf_counter()
         for _ in range(self.steps):
             for t, r in self.robots.items():
                 r.apply(targets[t], limit)
             mujoco.mj_step(self.model, self.data)
+        t1 = time.perf_counter()
+        T['physics'] = T.get('physics', 0.0) + t1 - t0
         for r in self.robots.values():
             r.integrate(self.period)
         now = stamp(self.data.time)
@@ -455,14 +465,18 @@ class SoccerSim:
         if self.tick % self.scan_ticks == 0:
             for r in self.robots.values():
                 r.publish_scan(now)
+        t2 = time.perf_counter()
+        T['publish'] = T.get('publish', 0.0) + t2 - t1
         if self.camera and self.data.time - self.last_cam >= self.cam_period - 1e-9:
             self.last_cam = self.data.time
             if self.renderer is None:
                 self.renderer = mujoco.Renderer(self.model, self.camera['height'], self.camera['width'])
                 self.option = mujoco.MjvOption()
                 self.option.geomgroup[1] = self.option.geomgroup[3] = 0      # hide collision shapes
+                self.option.geomgroup[4] = 0                                  # and the robot meshes
             for r in self.robots.values():
                 r.publish_image(self.renderer, self.option, now)
+            T['camera'] = T.get('camera', 0.0) + time.perf_counter() - t2
 
     def publish_truth(self, now):
         msg = TFMessage()
@@ -488,6 +502,18 @@ def main(args=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--viewer', action='store_true')
     ap.add_argument('--no-camera', action='store_true')
+    # 2026-11-25: 640x360 @ 15 Hz for two cameras (22 ms a frame with the robot meshes) plus physics took longer
+    # than real time - the match ran at 0.39x and the robots looked slow; 424x240 @ 10 Hz keeps up
+    ap.add_argument('--cam-size', default='424x240', help='WxH of the simulated robot cameras')
+    ap.add_argument('--cam-fps', type=float, default=10.0)
+    ap.add_argument('--bridge-hz', type=float, default=50.0)
+    ap.add_argument('--simple-robots', action='store_true', help='viewer: robots as simple shapes (faster)')
+    # a video straight from the simulator, frames taken at fixed SIMULATION time steps: smooth and at the right
+    # speed even when the PC is busy (a screen recorder made the sim stutter, 2026-11-25)
+    ap.add_argument('--record', default='', help='write the match to this video file (.mp4)')
+    ap.add_argument('--record-fps', type=float, default=20.0)
+    ap.add_argument('--record-size', default='960x540')
+    ap.add_argument('--viewer-hz', type=float, default=10.0, help='viewer redraws per wall second')
     ap.add_argument('--field-style', default='hardboard')
     ap.add_argument('--yellow-domain', type=int, default=37)
     ap.add_argument('--blue-domain', type=int, default=38)
@@ -495,12 +521,16 @@ def main(args=None):
     ap.add_argument('--blue-pose', default='auto', help='x,y,yaw (auto = +L/4, 0, pi)')
     ap.add_argument('--cam-tilt', type=float, default=20.0)
     ap.add_argument('--max-linear', type=float, default=0.30)
-    ap.add_argument('--ball-roll', type=float, default=0.0003, help='rolling friction [m]; larger = stops sooner')
+    ap.add_argument('--ball-roll', type=float, default=0.00022, help='rolling friction [m]; larger = stops sooner')
     ap.add_argument('--output-dir', default='/tmp/pinky_soccer/mujoco')
     opt, _ = ap.parse_known_args(args)
 
     from pinky_mujoco.model import load_settings
     settings = load_settings(None)
+    # real time (2026-11-25: the match ran at 0.47x - the robots looked slow): 50 Hz bridge ticks (10 physics
+    # steps of 2 ms each, unchanged physics), odometry / TF at 25 Hz - enough for AMCL and the striker
+    settings['rates']['bridge_hz'] = opt.bridge_hz
+    settings['rates']['state_hz'] = min(settings['rates']['state_hz'], 20.0)
     settings['control']['max_linear'] = opt.max_linear
     settings['control']['max_angular'] = 4.0
     L = resolve_dims(opt.field_style)[0]
@@ -509,26 +539,70 @@ def main(args=None):
         return default if text == 'auto' else tuple(float(v) for v in text.split(','))
     poses = {'yellow': pose(opt.yellow_pose, (-L / 4, 0.0, 0.0)), 'blue': pose(opt.blue_pose, (L / 4, 0.0, math.pi))}
     model, _ = build_scene(opt.output_dir, opt.field_style, opt.cam_tilt, poses, ball_roll=opt.ball_roll)
-    camera = None if opt.no_camera else {'width': 640, 'height': 360, 'fps': 15.0}
+    cw, ch = (int(v) for v in opt.cam_size.lower().split('x'))
+    camera = None if opt.no_camera else {'width': cw, 'height': ch, 'fps': opt.cam_fps}
     sim = SoccerSim(model, {'yellow': opt.yellow_domain, 'blue': opt.blue_domain}, settings, camera)
     viewer = None
     try:
         if opt.viewer:
-            import mujoco.viewer
-            viewer = mujoco.viewer.launch_passive(sim.model, sim.data, show_left_ui=False, show_right_ui=False)
+            import importlib
+            viewer = importlib.import_module('mujoco.viewer').launch_passive(sim.model, sim.data, show_left_ui=False, show_right_ui=False)
 
             def place():
                 viewer.cam.lookat[:] = [0, 0, 0]
                 viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation = 2.6, 90, -60
                 viewer.opt.geomgroup[1] = viewer.opt.geomgroup[3] = 0
+                # robot meshes in the viewer cost ~20 ms a redraw (742k vertices): --simple-robots shows the
+                # collision shapes instead (the match keeps real time)
+                viewer.opt.geomgroup[4] = 0 if opt.simple_robots else 1
+                # both teams' collision shapes (yellow = group 1, blue = group 3: LIDAR_GROUP)
+                viewer.opt.geomgroup[1] = viewer.opt.geomgroup[3] = 1 if opt.simple_robots else 0
             place()
         deadline = time.monotonic()
+        rec = None
+        if opt.record:
+            import cv2
+            rw, rh = (int(v) for v in opt.record_size.lower().split('x'))
+            model.vis.global_.offwidth = max(model.vis.global_.offwidth, rw)
+            model.vis.global_.offheight = max(model.vis.global_.offheight, rh)
+            rcam = mujoco.MjvCamera()
+            rcam.lookat[:] = [0, 0, 0]
+            rcam.distance, rcam.azimuth, rcam.elevation = 2.6, 90, -60
+            ropt = mujoco.MjvOption()
+            ropt.geomgroup[1] = ropt.geomgroup[3] = 0      # collision shapes off, detailed robot meshes on
+            ropt.geomgroup[4] = 1
+            path = os.path.expanduser(opt.record)
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            rec = {'w': cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), opt.record_fps, (rw, rh)),
+                   'r': mujoco.Renderer(model, rh, rw), 't': -1e9, 'cv2': cv2}
+            print(f'recording the match to {path} ({rw}x{rh} @ {opt.record_fps:g} fps of simulation time)',
+                  flush=True)
+        prof_t, prof_sim = time.monotonic(), sim.data.time
         while viewer is None or viewer.is_running():
+            ta = time.perf_counter()
             sim.spin_ros()
+            tb = time.perf_counter()
             with viewer.lock() if viewer else nullcontext():
                 sim.advance()
-            if viewer and sim.tick % 3 == 0:
+            tc = time.perf_counter()
+            if rec is not None and sim.data.time - rec['t'] >= 1.0 / opt.record_fps - 1e-9:
+                rec['t'] = sim.data.time
+                rec['r'].update_scene(sim.data, camera=rcam, scene_option=ropt)
+                rec['w'].write(rec['cv2'].cvtColor(rec['r'].render(), rec['cv2'].COLOR_RGB2BGR))
+            if viewer and time.monotonic() - getattr(sim, 'view_t', 0.0) >= 1.0 / opt.viewer_hz:
+                sim.view_t = time.monotonic()
                 viewer.sync()
+            P = sim.prof
+            P['ros_spin'] = P.get('ros_spin', 0.0) + tb - ta
+            P['advance(lock)'] = P.get('advance(lock)', 0.0) + tc - tb
+            P['viewer'] = P.get('viewer', 0.0) + time.perf_counter() - tc
+            if time.monotonic() - prof_t > 5.0:      # where the wall time goes (real-time factor < 1)
+                wall = time.monotonic() - prof_t
+                msg = (f'real-time factor {(sim.data.time - prof_sim) / wall:.2f}; per wall second: ' +
+                       ', '.join(f'{k} {1000 * v / wall:.0f} ms' for k, v in P.items()))
+                print(msg, flush=True)
+                P.clear()
+                prof_t, prof_sim = time.monotonic(), sim.data.time
                 if sim.tick == 60:
                     with viewer.lock():
                         place()
@@ -541,6 +615,12 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            if rec is not None:
+                rec['w'].release()                        # finish the video file
+                print(f'video saved: {opt.record}', flush=True)
+        except Exception:
+            pass
         try:
             if viewer:
                 viewer.close()

@@ -164,7 +164,8 @@ def launch_setup(context):
                 # '=' form: a pose like -0.415,0,0 would otherwise be read as an option
                 '--yellow-pose=' + ','.join(map(str, ypose)), '--blue-pose=' + ','.join(map(str, bpose)),
                 '--cam-tilt', v('cam_tilt_deg'), '--max-linear', str(float(v('max_speed')) + 0.02),
-                '--ball-roll', v('ball_roll')])]
+                '--ball-roll', v('ball_roll')] + (['--simple-robots'] if v('simple_robots') == 'true' else [])
+                + (['--record', v('record')] if v('record') else []))]
     else:
         sim_actions = [
             SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH', res),
@@ -181,6 +182,7 @@ def launch_setup(context):
             Node(package='pinky_soccer_game', executable='referee', name='referee', output='screen',
                  parameters=[{'field_length': L, 'field_width': W, 'goal_width': G, 'outer_strip': strip,
                               'match_control': True, 'win_score': int(v('win_score')),
+                              'auto_ball_reset': v('auto_ball_reset').lower() == 'true',
                               'ready_offset': _start_offset(v), 'sim_backend': sim,
                               'yellow_initialpose_topic': '/yellow/initialpose'}, SIM]),
             Node(package='pinky_soccer_game', executable='match_ui', name='match_ui', output='screen',
@@ -211,6 +213,10 @@ def generate_launch_description():
                               description="start pose from the own goal line [m]; 'line' = on the penalty line"),
         DeclareLaunchArgument('cam_tilt_deg', default_value='20'),
         DeclareLaunchArgument('win_score', default_value='5'),
+        DeclareLaunchArgument('auto_ball_reset', default_value='false'),   # true: referee moves the ball itself (tests)
+        DeclareLaunchArgument('record', default_value='',
+                              description='video file (.mp4) recorded by the simulator itself, e.g. ~/pinky_rl/videos/match.mp4'),
+        DeclareLaunchArgument('simple_robots', default_value='true'),     # true: viewer draws simple robot shapes (real time)   # true: referee moves the ball itself (tests)
         DeclareLaunchArgument('turn_max', default_value='2.0', description='rad/s max turn rate (rule-based striker)'),
         DeclareLaunchArgument('search_w', default_value='1.5', description='rad/s spin while looking for the ball'),
         DeclareLaunchArgument('policy_yellow', default_value='',
@@ -220,7 +226,7 @@ def generate_launch_description():
         DeclareLaunchArgument('avoid_opponent', default_value='true',
                               description='true: the other robot is an obstacle (slow down / go round it); '
                                           'false: contact allowed'),
-        DeclareLaunchArgument('ball_roll', default_value='0.0003', description='MuJoCo ball rolling friction [m]'),
+        DeclareLaunchArgument('ball_roll', default_value='0.00022', description='MuJoCo ball rolling friction [m]'),
         DeclareLaunchArgument('headless', default_value='false'),
         DeclareLaunchArgument('sensor_view', default_value='true',
                               description='window: each robot camera + detection, lidar, sensor values'),

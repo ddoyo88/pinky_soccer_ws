@@ -71,9 +71,10 @@ def robot_guard(v, opp_rel, priority=None, corridor=0.20):
     ahead = ox if v > 0 else -ox
     if ahead <= 0.0 or abs(oy) > corridor:
         return v
-    stop = 0.20 if priority is None else (0.17 if priority else 0.24)
+    # tighter (2026-11-25, user: 'smaller avoidance distance, just no contact'): bumpers touch at ~0.15 m
+    stop = 0.18 if priority is None else (0.155 if priority else 0.20)
     d = math.hypot(ox, oy)
-    return v * max(0.0, min(1.0, (d - stop) / 0.12))
+    return v * max(0.0, min(1.0, (d - stop) / 0.06))
 
 
 def over_line_ahead(pose, v, half_len, half_wid, goal_w):
@@ -86,13 +87,138 @@ def over_line_ahead(pose, v, half_len, half_wid, goal_w):
     x, y, yaw = pose
     reach = (0.05 if v > 0 else -0.08) + math.copysign(0.03 + 0.25 * abs(v), v)
     c, s = math.cos(yaw), math.sin(yaw)
-    for k in range(4):
-        along = reach * k / 3.0
-        for side in (-0.075, 0.0, 0.075):
-            px, py = x + c * along - s * side, y + s * along + c * side
-            if abs(py) > half_wid or (abs(px) > half_len and abs(py) > goal_w / 2 + 0.03):
+
+    def excess(px, py):                                   # how far past the boundary line (<= 0: inside)
+        e = abs(py) - half_wid
+        if abs(py) > goal_w / 2 + 0.03:
+            e = max(e, abs(px) - half_len)
+        return e
+
+    for side in (-0.075, 0.0, 0.075):
+        now = excess(x - s * side, y + c * side)
+        for k in range(1, 4):
+            along = reach * k / 3.0
+            e = excess(x + c * along - s * side, y + s * along + c * side)
+            # only motion that goes (further) out is stopped: a robot already on the line must still be able
+            # to drive back in (both robots froze on the side line, final5k)
+            if e > 0.0 and e > now + 1e-3:
                 return True
     return False
+
+
+def straight_cmd(me, ball, goal, half_w, v_max, state, behind=0.16, give_way=False, free=True, half_len=0.83):
+    """Straight-line ball play (2026-11-25, user: 'no zig-zag at all - approaching a far ball or dribbling is a
+    straight action'): replaces the learned policy's weaving for the approach and the dribble.
+      1) robot - ball - goal lined up: straight at the ball at full speed and push it on (heading P-control)
+      2) robot on the goal side of the ball: go round it via a point beside the ball (never push it backwards)
+      3) otherwise: to the point behind the ball (on the goal -> ball line) - turn on the spot first when the
+         heading is off, then drive straight with a gentle correction
+    me (x, y, yaw), ball (x, y), goal (x, y) in the map.  Returns (v, w, mode)."""
+    x, y, yaw = me
+    bx, by = ball
+    gx, gy = goal
+    ux, uy = gx - bx, gy - by                              # ball -> goal
+    n = math.hypot(ux, uy) or 1e-6
+    ux, uy = ux / n, uy / n
+    rx, ry = bx - x, by - y                                # robot -> ball
+    d = math.hypot(rx, ry) or 1e-6
+    to_ball = _wrap(math.atan2(ry, rx) - yaw)
+    lined = (rx * ux + ry * uy) / d                        # cos(robot->ball, ball->goal)
+
+    def drive(tx, ty, vmax):
+        err = _wrap(math.atan2(ty - y, tx - x) - yaw)
+        if abs(err) > 0.5:                                 # turn on the spot first: no curved weaving
+            return 0.0, max(-2.0, min(2.0, 2.5 * err))
+        return vmax * max(0.3, math.cos(err)), max(-1.5, min(1.5, 2.0 * err))
+
+    import time as _t
+    now = _t.time()
+    if give_way:
+        # give way at most 3 s per stand-off, then go in ourselves (both stood still for minutes, final5e)
+        t0 = state.setdefault('gw_t', now)
+        if now - t0 > 3.0:
+            give_way = False
+            if now - t0 > 6.0:
+                state.pop('gw_t', None)
+    else:
+        state.pop('gw_t', None)
+    if give_way:
+        # face-off at the ball and the other robot is closer: it goes first, we step back and wait 0.40 m off
+        if d < 0.40:
+            return -0.15, max(-1.5, min(1.5, 2.0 * to_ball)), 'GIVE_WAY'
+        return 0.0, max(-2.0, min(2.0, 2.5 * to_ball)), 'WAIT'
+    near_goal = math.hypot(gx - bx, gy - by) < 0.60
+    shot = state.get('shot')
+    if shot is not None:
+        # shot (free = the other robot > 0.5 m from the ball, else backing off loses the ball): step back a
+        # little, then hit the ball at full speed - an impact, not a push
+        if shot == 'back':
+            if d > 0.24 or abs(to_ball) > 0.6:
+                state['shot'] = 'charge'
+            return -0.20, max(-1.5, min(1.5, 2.0 * to_ball)), 'SHOT_BACK'
+        if d < 0.30 and abs(to_ball) < 0.6:
+            return v_max, max(-1.0, min(1.0, 2.0 * to_ball)), 'SHOT'
+        state.pop('shot', None)
+    if near_goal and lined > 0.93 and abs(to_ball) < 0.3 and d < 0.16 and free:
+        state['shot'] = 'back'
+        return -0.20, 0.0, 'SHOT_BACK'
+    if lined > 0.92 and abs(to_ball) < 0.45:               # (1) lined up: run through the ball toward the goal
+        aim = _wrap(math.atan2(gy - by, gx - bx) - yaw)
+        w = 2.5 * to_ball if d > 0.2 else 1.5 * to_ball + 1.0 * aim
+        return v_max, max(-1.5, min(1.5, w)), 'PUSH'
+    px, py = bx - ux * behind, by - uy * behind            # point behind the ball
+    py = max(-half_w + 0.10, min(half_w - 0.10, py))
+    px = max(-half_len + 0.12, min(half_len - 0.12, px))   # never into a goal mouth (blue got stuck, final5d)
+    if (x - bx) * ux + (y - by) * uy > -0.05:              # (2) level with / in front of the ball: round it
+        side = 1.0 if (-(uy) * (x - bx) + ux * (y - by)) >= 0 else -1.0
+        sx, sy = bx - uy * side * 0.22 - ux * 0.05, by + ux * side * 0.22 - uy * 0.05
+        sy = max(-half_w + 0.10, min(half_w - 0.10, sy))
+        sx = max(-half_len + 0.12, min(half_len - 0.12, sx))
+        if abs(sy - by) < 0.12:                            # no room on that side (ball at a line): other side
+            sx, sy = bx + uy * side * 0.22 - ux * 0.05, by - ux * side * 0.22 - uy * 0.05
+        v, w = drive(sx, sy, v_max)
+        return v, w, 'ROUND'
+    if math.hypot(px - x, py - y) < 0.06 or (d < 0.30 and abs(to_ball) < 0.3):
+        # behind it (or the spot behind it is clamped off a line / goal: never quite lined up): face the ball,
+        # then push it - standing at AIM with nothing to do froze the game for minutes (final5e)
+        if abs(to_ball) < 0.3:
+            return 0.7 * v_max, max(-1.5, min(1.5, 2.5 * to_ball)), 'PUSH'
+        return 0.0, max(-2.0, min(2.0, 2.5 * to_ball)), 'AIM'
+    v, w = drive(px, py, v_max)                            # (3) to the point behind the ball
+    return v, w, 'BEHIND'
+
+
+def rl_post_process(v, w, obs, state, v_max, smooth=True, push=True, field_len=1.66, alpha=0.5):
+    """Make the learned play look like football, not wiggling (2026-11-25, user: 'it sways left and right on the
+    way to the ball and keeps turning while dribbling'):
+      * smooth: the policy flips the turn rate between +-4 rad/s from one 0.1 s step to the next (it was never
+        penalised for it) -> low-pass the turn rate (EMA); the policy keeps seeing its own raw action
+      * push: ball sitting on the nose and the goal ahead -> a straight push toward the goal at full speed, the
+        turn rate only for keeping the ball centred and aiming (the policy zig-zagged the ball forward)
+    obs: the 19-value policy input (ball / goal in the robot frame).  state: dict kept by the caller."""
+    bx, by, seen = obs[0], obs[1], obs[2] > 0.5
+    gx, gy = obs[8] * field_len, obs[9] * field_len
+    pushing = False
+    if push and seen and 0.04 < bx < 0.20 and abs(by) < 0.05:
+        aim = math.atan2(gy - by, gx - bx)               # goal direction seen from the ball
+        if abs(aim) < 0.6 and gx > 0.0:
+            v = v_max
+            w = max(-1.5, min(1.5, 2.0 * aim + 2.5 * math.atan2(by, bx)))
+            pushing = True
+    elif push and seen and 0.04 < bx < 0.9 and gx > 0.0:
+        # lined up (robot - ball - goal on one line, kick-off and every run from behind the ball): straight at
+        # the ball at full speed instead of the policy's slow weaving approach
+        to_ball = math.atan2(by, bx)
+        aim = math.atan2(gy - by, gx - bx)
+        if abs(to_ball) < 0.5 and abs(_wrap(aim - to_ball)) < 0.35:
+            v = v_max
+            w = max(-1.5, min(1.5, 3.0 * to_ball))
+            pushing = True
+    if smooth and not pushing:
+        w = alpha * state.get('w', w) + (1.0 - alpha) * w
+    state['w'] = w
+    state['pushing'] = pushing
+    return v, w
 
 
 def robot_guard_vw(v, w, opp_rel, priority=None):
@@ -107,11 +233,11 @@ def robot_guard_vw(v, w, opp_rel, priority=None):
         return v, w
     ox, oy = float(opp_rel[0]), float(opp_rel[1])
     d = math.hypot(ox, oy)
-    if d < 0.20:
-        w *= max(0.0, min(1.0, (d - 0.14) / 0.06))
+    if d < 0.18:
+        w *= max(0.0, min(1.0, (d - 0.14) / 0.04))
     # personal space 0.17 m; giving way (the other robot has the right of way at the ball): 0.24 m - backing
     # off frees the ball for it (otherwise a ball between the two robots stayed there: r2s2, 2026-11-25)
-    space = 0.24 if priority is False else 0.17
+    space = 0.20 if priority is False else 0.155
     if d < space:
         away = -0.08 if ox > 0.0 else 0.08          # other robot in front -> back up, behind/beside -> forward
         if v * away <= 0.0 or abs(v) < abs(away):
