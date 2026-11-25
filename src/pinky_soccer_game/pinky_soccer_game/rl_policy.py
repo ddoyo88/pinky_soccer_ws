@@ -57,7 +57,7 @@ def has_priority(me, opp, ball, tie_first, margin=0.03, had=None, keep=0.06):
     return d_me < d_opp
 
 
-def robot_guard(v, opp_rel, priority=None, corridor=0.16):
+def robot_guard(v, opp_rel, priority=None, corridor=0.20):
     """No collisions with the other robot (shared by the RL training environment and the ROS striker).
     opp_rel: other robot centre in this robot's frame (x forward, y left) or None.  Driving towards it (it lies
     in the corridor ahead when v > 0, behind when v < 0): full speed until 0.12 m before the stop distance,
@@ -74,6 +74,49 @@ def robot_guard(v, opp_rel, priority=None, corridor=0.16):
     stop = 0.20 if priority is None else (0.17 if priority else 0.24)
     d = math.hypot(ox, oy)
     return v * max(0.0, min(1.0, (d - stop) / 0.12))
+
+
+def over_line_ahead(pose, v, half_len, half_wid, goal_w):
+    """The white boundary line from the robot's own map pose (shared by the RL environment and the striker,
+    next to the camera line guard): the strip the robot sweeps next - front 0.05 / rear 0.08 m + 0.03 m +
+    braking 0.25 s, half width 0.075 m - reaches past the boundary line (goal mouths excepted).  Works in
+    every direction (the camera only sees ahead: reversing / turning crossed the line, 2026-11-25)."""
+    if abs(v) < 1e-3:
+        return False
+    x, y, yaw = pose
+    reach = (0.05 if v > 0 else -0.08) + math.copysign(0.03 + 0.25 * abs(v), v)
+    c, s = math.cos(yaw), math.sin(yaw)
+    for k in range(4):
+        along = reach * k / 3.0
+        for side in (-0.075, 0.0, 0.075):
+            px, py = x + c * along - s * side, y + s * along + c * side
+            if abs(py) > half_wid or (abs(px) > half_len and abs(py) > goal_w / 2 + 0.03):
+                return True
+    return False
+
+
+def robot_guard_vw(v, w, opp_rel, priority=None):
+    """robot_guard for the whole command (2026-11-25): head-on driving as above (corridor widened to 0.20 m),
+    plus what it did not cover - side-by-side contact:
+      * turning close to the other robot: the body corners lie ~0.10 m from the centre, so the turn rate is
+        scaled down from 0.20 m centre distance and is zero at 0.14 m;
+      * closer than 0.17 m (personal space; 0.24 m when giving way at the ball): drive slowly (0.08 m/s) away
+        from the other robot - both robots do this, so they separate."""
+    v = robot_guard(v, opp_rel, priority)
+    if opp_rel is None:
+        return v, w
+    ox, oy = float(opp_rel[0]), float(opp_rel[1])
+    d = math.hypot(ox, oy)
+    if d < 0.20:
+        w *= max(0.0, min(1.0, (d - 0.14) / 0.06))
+    # personal space 0.17 m; giving way (the other robot has the right of way at the ball): 0.24 m - backing
+    # off frees the ball for it (otherwise a ball between the two robots stayed there: r2s2, 2026-11-25)
+    space = 0.24 if priority is False else 0.17
+    if d < space:
+        away = -0.08 if ox > 0.0 else 0.08          # other robot in front -> back up, behind/beside -> forward
+        if v * away <= 0.0 or abs(v) < abs(away):
+            v = away
+    return v, w
 
 
 class RLPlayer:

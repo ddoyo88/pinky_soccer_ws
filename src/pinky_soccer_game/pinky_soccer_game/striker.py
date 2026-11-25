@@ -116,6 +116,8 @@ class Striker(Node):
         P('outer_strip', FIELD_STRIP)      # field edge -> wall distance (detour points may use it)
         P('policy_path', '')               # RL policy (.npz from pinky_soccer_rl.export): plays the PLAY phase
                                            # instead of the rule-based state machine; '' = rules
+        P('rl_idle_after', 3.0)            # [s] RL mode: the robot hardly moves this long in play -> the rule-
+        P('rl_rules_for', 4.0)             # based striker plays this long (orbit, dribble), then the policy again
         P('rl_search_after', 3.0)          # [s] RL mode: ball unseen this long -> the rule-based search (back up,
                                            # turn, roam) until the camera sees it again, then the policy again
         P('line_guard', True)              # never drive over the white boundary line (camera, line/boundary)
@@ -188,9 +190,11 @@ class Striker(Node):
             self.create_subscription(String, '/game/control', self._match_control, 10)
             self.create_subscription(String, '/game/kickoff', self._kickoff, 10)
             self.create_subscription(String, '/game/goal', self._goal_scored, 10)
+            self.create_subscription(String, '/game/event', self._game_event, 10)
 
         self.cmd_pub = GuardedPublisher(self.create_publisher(Twist, self.get_parameter('cmd_topic').value, 10),
-                                        lambda c: self._robot_guard(self._line_guard(c)))
+                                        lambda c: self._line_guard(self._robot_guard(c)))   # line last: moving
+                                                                                            # apart never crosses it
         self.line_pts, self.line_t, self.line_stops = np.zeros((0, 2)), 0.0, 0
         self.create_subscription(PoseArray, 'line/boundary', self._line, 10)
         self.rl, self.rl_t, self.rl_cmd = None, 0.0, (0.0, 0.0)
@@ -214,8 +218,19 @@ class Striker(Node):
 
     # ------------------------------------------------------------------ subscriptions
     def _ball(self, m):
+        if time.time() < getattr(self, 'ball_reset_until', 0.0) and math.hypot(m.point.x, m.point.y) > 0.30:
+            return                                        # a frame from before the referee moved the ball
         self.ball = np.array([m.point.x, m.point.y])
         self.ball_t = time.time()
+
+    def _game_event(self, m):
+        """The referee put the ball back on the centre spot: forget the old spot (corner, beside the goal) and
+        remember the ball at the centre, so the robot turns there at once instead of searching the old place."""
+        t = m.data
+        if ('중앙' in t or '가운데' in t) and '못함' not in t:
+            self.ball = np.array([0.0, 0.0])
+            self.ball_t = time.time() - self.get_parameter('rl_search_after').value - 0.05
+            self.ball_reset_until = time.time() + 1.0
 
     def _scan(self, m):
         self.scan = m
@@ -305,10 +320,35 @@ class Striker(Node):
         """PLAY with the learned policy: a new action every 0.1 s (the training rate), repeated in between."""
         unseen = (now - self.ball_t) if self.ball is not None else 1e9
         if unseen > self.get_parameter('rl_search_after').value:
-            # safety net for the game flow: the policy does not find the ball -> the proven search routine
+            # safety net for the game flow: the policy does not find the ball -> first turn to where it was last
+            # seen (quick), then the proven search routine (back up, spin, roam)
             self.cancel_nav()
             self.play_ctx = (pose, self.estimate_opponent(pose), None)
-            self.search(pose[0], pose[1], pose[2], now)
+            look = self.get_parameter('rl_search_after').value + 2.0
+            err = wrap(math.atan2(self.ball[1] - pose[1], self.ball[0] - pose[0]) - pose[2]) \
+                if self.ball is not None else 0.0
+            near = self.ball is not None and math.hypot(self.ball[0] - pose[0], self.ball[1] - pose[1]) < 0.35
+            if near and unseen < look + 2.0:
+                # the ball should be right in front but the camera does not see it (too close, under the image):
+                # face the remembered spot and back up a little so it comes into view
+                cmd = Twist()
+                cmd.angular.z = clip(3.0 * err, -2.0, 2.0)
+                from pinky_soccer_game.rl_policy import over_line_ahead
+                back = -0.12
+                if over_line_ahead(pose, back, self.L / 2, self.W / 2, self.G):
+                    back = 0.08                      # line behind: creep to the remembered spot, a touch moves the ball
+                cmd.linear.x = back if abs(err) < 0.5 else 0.0
+                self.cmd_pub.publish(cmd)
+                self.set_state('NEAR_BACKUP')
+                self.search_phase = None
+            elif self.ball is not None and unseen < look and abs(err) > 0.25:
+                cmd = Twist()
+                cmd.angular.z = clip(3.0 * err, -2.0, 2.0)
+                self.cmd_pub.publish(cmd)
+                self.set_state('LOOK_TOWARD')
+                self.search_phase = None
+            else:
+                self.search(pose[0], pose[1], pose[2], now)
             self.rl_t = 0.0                                  # fresh policy step as soon as the ball is back
             return
         self.search_phase = None
@@ -329,6 +369,9 @@ class Striker(Node):
             self.set_state('RL_ESCAPE')
             return
         cmd.linear.x, cmd.angular.z = self.rl_cmd
+        # the robot's nose never goes under a crossbar (it got stuck in the goal; the ball still goes in)
+        cmd.linear.x = goal_mouth_guard(pose, cmd.linear.x, self.L / 2, self.G,
+                                        nose=0.09 + 0.25 * abs(cmd.linear.x))   # + braking at full speed
         self.guard_hit = False
         self.cmd_pub.publish(cmd)                    # line guard still applies
         if self.guard_hit:
@@ -346,36 +389,55 @@ class Striker(Node):
 
     def _robot_guard(self, cmd):
         """No collisions: the other robot (lidar estimate, fresh) in the way -> slow down / stop that motion."""
-        if not self.get_parameter('robot_guard').value or self.opp is None or time.time() - self.opp_t > 0.6:
+        if not self.get_parameter('robot_guard').value or self.opp is None:
             return cmd
         pose = self.robot_pose()
-        if pose is None:
+        if pose is None or time.time() - self.opp_t > self._opp_hold(pose):
             return cmd
         rx, ry, ryaw = pose
         dx, dy = self.opp[0] - rx, self.opp[1] - ry
         c, s = math.cos(ryaw), math.sin(ryaw)
-        from pinky_soccer_game.rl_policy import has_priority, robot_guard
+        from pinky_soccer_game.rl_policy import has_priority, robot_guard_vw
         # right of way: the robot closer to the ball (camera ball, lidar opponent) goes first; tie -> yellow
         ball = self.ball if (self.ball is not None and time.time() - self.ball_t < 1.0) else None
-        prio = has_priority((rx, ry), self.opp, ball, self.get_parameter('team').value == 'yellow',
-                            had=getattr(self, 'had_priority', None) if ball is not None else None)
-        if prio != getattr(self, 'had_priority', None):
-            self.had_priority = prio
+        if ball is None:
+            prio = False                                 # cannot see the ball: never claim the right of way
+        else:                                            # (it held its ground blind in front of its goal, r4s1)
+            prio = has_priority((rx, ry), self.opp, ball, self.get_parameter('team').value == 'yellow',
+                                had=getattr(self, 'had_priority', None))
+        had = getattr(self, 'had_priority', None)
+        if had is not None and prio != had and time.time() - getattr(self, 'prio_t', 0.0) < 1.0:
+            prio = had                                   # keep a right-of-way decision at least 1 s
+        if prio != had:
+            self.had_priority, self.prio_t = prio, time.time()
             if ball is not None:
                 self.get_logger().info('right of way at the ball: ' + ('mine - going in' if prio else
                                                                      'the other robot is closer - giving way'))
-        v = robot_guard(cmd.linear.x, (c * dx + s * dy, -s * dx + c * dy), prio)
+        v, w = robot_guard_vw(cmd.linear.x, cmd.angular.z, (c * dx + s * dy, -s * dx + c * dy), prio)
         if v != cmd.linear.x:
             self.robot_stops = getattr(self, 'robot_stops', 0) + 1
             if v == 0.0 and self.robot_stops % 20 == 1:
                 self.get_logger().info(f'other robot {math.hypot(dx, dy):.2f} m in the way: stop')
-        cmd.linear.x = v
+        cmd.linear.x, cmd.angular.z = v, w
         return cmd
 
     def _line_guard(self, cmd):
         """Boundary points (base frame, from the camera) inside the strip the robot would sweep next -> no
-        motion in that direction (turning stays allowed, so the robot can face away and carry on)."""
-        if not self.get_parameter('line_guard').value or time.time() - self.line_t > 1.0 or not len(self.line_pts):
+        motion in that direction (turning stays allowed, so the robot can face away and carry on).
+        First the same check from the robot's own map pose (any direction - the camera only sees ahead)."""
+        if not self.get_parameter('line_guard').value:
+            return cmd
+        pose = self.robot_pose()
+        if pose is not None and abs(cmd.linear.x) > 1e-3:
+            from pinky_soccer_game.rl_policy import over_line_ahead
+            if over_line_ahead(pose, cmd.linear.x, self.L / 2, self.W / 2, self.G):
+                cmd.linear.x = 0.0
+                self.guard_hit = True                        # the RL escape logic counts this too
+                self.line_stops += 1
+                if self.line_stops % 20 == 1:
+                    self.get_logger().info('boundary line (map) in the way: stop')
+                return cmd
+        if time.time() - self.line_t > 1.0 or not len(self.line_pts):
             return cmd
         v = cmd.linear.x
         if abs(v) < 1e-3:
@@ -448,12 +510,20 @@ class Striker(Node):
         r0, r1, c0, c1 = max(0, r - 2), min(h, r + 3), max(0, c - 2), min(w, c + 3)
         return bool((grid[r0:r1, c0:c1] > 50).any())
 
+    def _opp_hold(self, pose):
+        """How long the last lidar opponent stays valid: 0.6 s, but 2 s when it was close - right next to us its
+        body is inside the lidar's minimum range (< 0.10 m), so it vanishes exactly when the guard needs it."""
+        if self.opp is not None and pose is not None and \
+                math.hypot(self.opp[0] - pose[0], self.opp[1] - pose[1]) < 0.30:
+            return 2.0
+        return 0.6
+
     def estimate_opponent(self, pose):
         """Lidar returns that are not explained by the static map -> opponent robot (nearest cluster)."""
         if not self.get_parameter('use_opponent').value:
             return None
         if self.scan is None or self.map is None or pose is None:
-            return self.opp if time.time() - self.opp_t < 0.6 else None
+            return self.opp if time.time() - self.opp_t < self._opp_hold(pose) else None
         s = self.scan
         try:    # use the TF of the scan frame: Pinky's rplidar_link is rotated 180 deg w.r.t. base_link
             t = self.tf_buffer.lookup_transform('map', s.header.frame_id, rclpy.time.Time())
@@ -478,7 +548,7 @@ class Striker(Node):
             if len(cl) >= 2:
                 self.opp = np.array([np.mean([c[0] for c in cl]), np.mean([c[1] for c in cl])])
                 self.opp_t = time.time()
-        if time.time() - self.opp_t < 0.6 and self.opp is not None:
+        if self.opp is not None and time.time() - self.opp_t < self._opp_hold(pose):
             m = PointStamped()
             m.header.frame_id = 'map'
             m.header.stamp = self.get_clock().now().to_msg()
@@ -716,8 +786,19 @@ class Striker(Node):
             self.set_state('SCORER_WAIT')
             return
         if self.rl is not None:
-            self._rl_play((rx, ry, ryaw), time.time())
-            return
+            now_t = time.time()
+            # safety net for the game flow: the policy standing still in play (r3s3: 10 s next to the ball)
+            ref = getattr(self, 'rl_idle_ref', None)
+            if ref is None or math.hypot(rx - ref[0], ry - ref[1]) > 0.03 or abs(wrap(ryaw - ref[2])) > 0.2:
+                self.rl_idle_ref = (rx, ry, ryaw, now_t)
+            elif now_t - ref[3] > self.get_parameter('rl_idle_after').value and now_t >= getattr(self, 'rl_rules_until', 0):
+                self.rl_rules_until = now_t + self.get_parameter('rl_rules_for').value
+                self.rl_idle_ref = None
+                self.get_logger().info('RL policy idle -> rule-based play for a moment')
+            if now_t >= getattr(self, 'rl_rules_until', 0.0):
+                self._rl_play((rx, ry, ryaw), now_t)
+                return
+            # else: fall through to the rule-based state machine below
         if self.match_control and self.kickoff in ('YELLOW', 'BLUE') and self.kickoff != me_team:
             # the other team's kickoff: it must touch the ball first -> stay at the start position
             self.cancel_nav()
@@ -1071,7 +1152,8 @@ class Striker(Node):
         me, opp, ball = self.play_ctx
         cmd.linear.x, cmd.angular.z, _ = avoid_opponent(me, cmd.linear.x, cmd.angular.z, opp, ball,
                                                         w_max=self.get_parameter('w_max').value)
-        cmd.linear.x = goal_mouth_guard(me, cmd.linear.x, self.L / 2, self.G)
+        cmd.linear.x = goal_mouth_guard(me, cmd.linear.x, self.L / 2, self.G,
+                                        nose=0.09 + 0.25 * abs(cmd.linear.x))   # + braking at full speed
         self.cmd_pub.publish(cmd)
 
     def set_state(self, s):

@@ -55,13 +55,13 @@ class Referee(Node):
         self.declare_parameter('sim_backend', 'gz')          # gz | mujoco (how the ball / a robot is moved)
         self.declare_parameter('yellow_initialpose_topic', '/initialpose')   # duel: /yellow/initialpose
         self.declare_parameter('ball_radius', 0.02135)
-        self.declare_parameter('stuck_timeout', 20.0)      # s without ANY ball movement (deadlock: both robots
+        self.declare_parameter('stuck_timeout', 10.0)      # s without ANY ball movement (deadlock: both robots
                                                            # stuck next to it) -> centre; 0 = off
                                                            # (match rule: a ball lying alone is left alone)
         self.declare_parameter('wedge_timeout', 5.0)       # s, ball stuck together with a robot -> centre
         self.declare_parameter('wall_zone', 0.06)          # m: ball this close to the boundary LINE (or beyond
                                                            # it; the robots must not cross the line) ...
-        self.declare_parameter('wall_stuck_time', 10.0)    # ... and not moving this long -> centre (robots
+        self.declare_parameter('wall_stuck_time', 3.0)     # ... and not moving this long -> centre (robots
                                                            # cannot get behind a ball lying on the wall)
         self.declare_parameter('corner_zone', 0.20)        # m from both walls = in a corner
         self.declare_parameter('wedge_wall_dist', 0.15)    # ball centre this close to a wall = 'at the wall'
@@ -215,6 +215,12 @@ class Referee(Node):
             self.kickoff = 'OPEN'
             self._event('바로 시작! - 지금 위치에서 경기 진행')
             self._start()
+        elif cmd == 'BALL_CENTRE':                     # match window button: only the ball to the centre spot
+            self.ball_request_t = time.time()
+            if self._centre_ball('공 가운데로 (버튼) - 로봇·점수 그대로, 경기 계속'):
+                self.ball_request_t = None
+                self.last_ball = None
+                self.last_move_t = time.time()
         elif cmd == 'STOP':
             self._set_phase('WAIT')
             self._event('경기 중지')
@@ -358,8 +364,13 @@ class Referee(Node):
             if not inside:
                 self.jam_since.pop(name, None)
                 continue
-            first = self.jam_since.setdefault(name, now)
-            if now - first < self.get_parameter('jam_timeout').value:
+            # only a robot that really cannot move: one turning away after a goal right at the line is not stuck
+            # (it was lifted out while starting its celebration, r2s3)
+            ref = self.jam_since.get(name)
+            if ref is None or math.hypot(p[0] - ref[1], p[1] - ref[2]) > 0.03 or abs(_wrap(p[3] - ref[3])) > 0.3:
+                self.jam_since[name] = (now, p[0], p[1], p[3])
+                continue
+            if now - ref[0] < self.get_parameter('jam_timeout').value:
                 continue
             self.jam_since.pop(name, None)
             start = self.L / 2 - self.get_parameter('ready_offset').value
@@ -441,6 +452,13 @@ class Referee(Node):
 
     def tick(self):
         now = time.time()
+        req = getattr(self, 'ball_request_t', None)
+        if req is not None:                            # button pressed while a robot stood on the centre spot
+            if self._centre_ball('공 가운데로 (버튼) - 로봇·점수 그대로, 경기 계속'):
+                self.ball_request_t, self.last_ball, self.last_move_t = None, None, now
+            elif now - req > 3.0:
+                self.ball_request_t = None
+                self._event('공 가운데로: 센터에 로봇이 있어서 옮기지 못함 - 다시 눌러 주세요')
         if self.match_control:
             self.pub_kickoff.publish(String(data=self.kickoff))
             if self.match_phase in ('PREPARE', 'START', 'GOAL'):   # GOAL: the scorer may be stuck in there
@@ -514,8 +532,8 @@ class Referee(Node):
                 still = now - self.last_move_t
                 wedged = self._wedged(bx, by)
                 zone = self.get_parameter('wall_zone').value
-                on_wall = ((self.L / 2 - abs(bx) < zone and abs(by) > self.G / 2) or   # not the goal mouth
-                           self.W / 2 - abs(by) < zone)
+                on_wall = ((self.L / 2 - abs(bx) < zone + 0.03 and abs(by) > self.G / 2) or   # end line incl.
+                           self.W / 2 - abs(by) < zone)                                 # next to a post
                 if on_wall and not wedged and still > self.get_parameter('wall_stuck_time').value:
                     if self._centre_ball('공이 라인에 붙어 안 움직임 -> 공만 중앙으로, 경기 계속'):
                         self.last_ball = None
@@ -523,7 +541,7 @@ class Referee(Node):
                 elif (wedged and still > self.get_parameter('wedge_timeout').value) \
                         or 0 < self.get_parameter('stuck_timeout').value < still:
                     if self._centre_ball('공이 모서리에 걸려 못 빠져나옴 -> 중앙으로' if wedged else
-                                         '공이 20초 동안 안 움직임 (막힘) -> 공만 중앙으로, 경기 계속'):
+                                         '공이 10초 동안 안 움직임 (막힘) -> 공만 중앙으로, 경기 계속'):
                         self.last_ball = None
                         self.last_move_t = now
             return

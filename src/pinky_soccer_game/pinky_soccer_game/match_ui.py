@@ -94,13 +94,17 @@ class MatchWindow:
         self.undo_button.grid(row=0, column=2, padx=6)
         self.stop_button = tk.Button(controls, text='정지', command=self.stop,
                                      bg='#5a1f1f', activebackground='#7a2a2a', **style)
-        self.stop_button.grid(row=1, column=1, columnspan=2, pady=(8, 0), sticky='ew', padx=6)
+        self.stop_button.grid(row=1, column=2, pady=(8, 0), padx=6)
+        self.ball_button = tk.Button(controls, text='공 가운데로', command=self.ball_centre,
+                                     bg='#c25e00', activebackground='#e07000', **style)
+        self.ball_button.grid(row=1, column=1, pady=(8, 0), padx=6)
         self.force_button = tk.Button(controls, text='바로 시작', command=self.force_start,
                                       bg='#b8860b', activebackground='#d4a017', **style)
         self.force_button.grid(row=1, column=0, pady=(8, 0), padx=6)
         tk.Label(self.root, text='원위치: 문제가 생기면 로봇을 출발 위치로 돌리고 직전 킥오프부터 다시 (점수 유지)\n'
                                  '직전 골 취소: 잘못 감지된 골을 되돌리고 그 골 전 킥오프부터 다시\n'
-                                 '바로 시작: 로봇·공이 어디 있든 지금 바로 경기 진행',
+                                 '바로 시작: 로봇·공이 어디 있든 지금 바로 경기 진행\n'
+                                 '공 가운데로: 경기 중 언제든 공만 센터로 (로봇·점수 그대로, 실물은 안내 + 소리)',
                  font=('DejaVu Sans', 9), fg='#7f93a3', bg='#101820', justify='center').pack(pady=(10, 0))
         self.event_label = tk.Label(self.root, text='', wraplength=540, justify='center',
                                     font=('DejaVu Sans', 10), fg='#d3dce3', bg='#101820')
@@ -134,6 +138,9 @@ class MatchWindow:
 
     def force_start(self):
         self.node.send_control('FORCE_START')
+
+    def ball_centre(self):
+        self.node.send_control('BALL_CENTRE')
 
     def refresh(self):
         phase, (yellow, blue), event, kickoff, goals = self.node.snapshot()

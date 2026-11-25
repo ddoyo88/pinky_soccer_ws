@@ -44,7 +44,7 @@ from pinky_soccer_sim.field import resolve_dims
 
 import sys as _sys
 _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'pinky_soccer_game'))
-from pinky_soccer_game.rl_policy import has_priority, robot_guard  # noqa: E402  (the striker uses the same)
+from pinky_soccer_game.rl_policy import has_priority, robot_guard_vw  # noqa: E402  (the striker uses the same)
 
 PARK = {'blue': (0.0, 3.0)}         # no opponent: the other robot far outside the field (re-placed every step)
 OBS_BASE, OBS_VEL = 17, 19
@@ -273,25 +273,25 @@ class PinkySoccerEnv(gym.Env):
         self.queue.append(action)
         a = self.queue.pop(0)
         v, w = a[0] * self.v_max, a[1] * self.w_max
-        self.guarded = False
-        if self.line_guard and self._over_line_ahead('yellow', v):
-            v, self.guarded = 0.0, True                         # same hard stop as the striker's line guard
-        self.robot_guarded = False
+        self.guarded = self.robot_guarded = False
         if self.opp_active:                                     # same no-collision guard as the striker
             self.priority = has_priority(self._pose('yellow'), self._pose('blue'), self._ball(), self.tie_yellow,
                                          had=self.priority)
-            v_g = robot_guard(v, self._to_robot(self._pose('blue')[:2], self._pose('yellow')), self.priority)
-            self.robot_guarded = abs(v_g) < abs(v) - 1e-6
-            v = v_g
+            v_g, w_g = robot_guard_vw(v, w, self._to_robot(self._pose('blue')[:2], self._pose('yellow')),
+                                      self.priority)
+            self.robot_guarded = abs(v_g) < abs(v) - 1e-6 or abs(w_g) < abs(w) - 1e-6
+            v, w = v_g, w_g
+        if self.line_guard and self._over_line_ahead('yellow', v):
+            v, self.guarded = 0.0, True                         # same hard stop as the striker's line guard
         targets = {'yellow': self._wheels('yellow', v, w)}
         if self.opp_active:
             bv, bw = self._scripted_cmd() if self.opp_kind == 'scripted' else self._policy_cmd()
-            if self.line_guard and self._over_line_ahead('blue', bv):
-                bv = 0.0
             blue_first = has_priority(self._pose('blue'), self._pose('yellow'), self._ball(), not self.tie_yellow,
                                       had=self.blue_priority)
             self.blue_priority = blue_first
-            bv = robot_guard(bv, self._to_robot(self._pose('yellow')[:2], self._pose('blue')), blue_first)
+            bv, bw = robot_guard_vw(bv, bw, self._to_robot(self._pose('yellow')[:2], self._pose('blue')), blue_first)
+            if self.line_guard and self._over_line_ahead('blue', bv):
+                bv = 0.0
             targets['blue'] = self._wheels('blue', bv, bw)
         poses0 = {t: self._pose(t) for t in targets}
         for _ in range(self.substeps):

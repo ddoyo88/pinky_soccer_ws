@@ -62,6 +62,7 @@
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): 구조 그림, 데이터 흐름, 공부 순서
 - [docs/CODE_GUIDE.md](docs/CODE_GUIDE.md): **파일별 역할, 토픽, 설정값, 설정 파일 위치, 경기 진행 순서**
 - [docs/RL_TRAINING.md](docs/RL_TRAINING.md): 강화학습 설계, 학습 순서, 결과 기록
+- [docs/MATCH_REPORT.md](docs/MATCH_REPORT.md): 시뮬레이션 15세트 반복 개선 결과 (세트별 점수, 고친 내용, 추세)
 - [docs/PROJECT_LOG.md](docs/PROJECT_LOG.md): **작업 기록(시간 순서)과 모든 파일의 저장 위치 목록**
 
 ### 폴더 구성
@@ -153,7 +154,7 @@ ros2 launch pinky_soccer_bringup sim_duel.launch.py
    ```bash
    ros2 launch pinky_soccer_bringup real_duel.launch.py
    ```
-6. 경기 창에서 **경기 시작**을 누르면 두 로봇이 시작 위치로 정렬하고, 센터 공이 2초 동안 가만히 있으면 시작합니다. **바로 시작**은 지금 자리에서 시작, **정지**는 두 로봇을 멈춥니다.
+6. 경기 창에서 **경기 시작**을 누르면 두 로봇이 시작 위치로 정렬하고, 센터 공이 2초 동안 가만히 있으면 시작합니다. **바로 시작**은 지금 자리에서 시작, **정지**는 두 로봇을 멈춥니다. **공 가운데로**는 경기 중 언제든 공만 센터로 보냅니다(실물은 안내와 소리, 로봇과 점수는 그대로).
 
 ---
 

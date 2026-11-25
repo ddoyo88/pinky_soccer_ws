@@ -162,7 +162,7 @@ pinky_soccer_ws/
 - **공 처리:** 골라인 밖 공, 라인에 붙은 공, 코너 공은 사람이 옮기도록 안내하고 소리를 냅니다.
 
 #### `match_ui.py`: 경기 창
-- 점수판, 골 기록, 버튼(경기 시작, 원위치, 직전 골 취소, 정지, 바로 시작)이 있습니다. 버튼을 누르면 `/game/control`로 보냅니다.
+- 점수판, 골 기록, 버튼(경기 시작, 원위치, 직전 골 취소, 정지, 바로 시작, **공 가운데로**)이 있습니다. 버튼을 누르면 `/game/control`로 보냅니다.
 
 #### `sensor_view.py`: 센서 창
 - 로봇마다 카메라(공 인식 표시), 라이다(위에서 본 그림), 상태, 속도, 위치, 공 거리를 보여 줍니다.
@@ -275,7 +275,7 @@ pinky_soccer_ws/
 ### 경기 공용 (`/game/*`, 노랑 도메인에서 나와 파랑 도메인으로 중계)
 | 토픽 | 내용 | 보내는 쪽 |
 |---|---|---|
-| `/game/control` | `NEW_GAME`, `RESET`, `UNDO_GOAL`, `STOP`, `FORCE_START` (버튼) / `PREPARE`, `START`, `GOAL`, `WAIT` (심판 → 로봇) | 경기 창, 심판 |
+| `/game/control` | `NEW_GAME`, `RESET`, `UNDO_GOAL`, `STOP`, `FORCE_START`, `BALL_CENTRE` (버튼) / `PREPARE`, `START`, `GOAL`, `WAIT` (심판 → 로봇) | 경기 창, 심판 |
 | `/game/phase` | WAIT / PREPARE / START / GOAL / CORNER / FINISHED | 심판 |
 | `/game/score`, `/game/goals`, `/game/event` | 점수, 골 기록, 안내 문장 | 심판 |
 | `/game/goal` | 골 넣은 팀 (세레모니할 로봇) | 심판 |
