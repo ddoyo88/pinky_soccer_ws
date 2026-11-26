@@ -127,13 +127,16 @@ def _robot(context, team, domain, gz_prefix, pose, L, W, G, strip, v, sim='gz'):
                 {**field_forward(), 'namespace': ns, 'max_linear': v('max_speed'),
                  'real_robot': 'true',             # lidar-weighted AMCL (pushing / spinning makes the wheels slip)
                  'initial_x': str(x), 'initial_y': str(y), 'initial_yaw': str(yaw)}),
-        Node(package='pinky_soccer_vision', executable='ball_detector', namespace=ns, name='ball_detector',
+
+    ]
+    if not (team == 'blue' and v('drill').lower() == 'true'):        # drill: blue stands parked, no striker
+        # (and no camera: its ball estimates - with a lost localisation - misled yellow through the shared ball)
+        actions.append(Node(package='pinky_soccer_vision', executable='ball_detector', namespace=ns, name='ball_detector',
              output='log', remappings=TF_REMAP,
              parameters=[{'backend': v('backend'), 'model_path': '', 'process_every_n': 1,
-                          'field_length': L, 'field_width': W, 'goal_width': G}, SIM]),
-        Node(package='pinky_soccer_game', executable='striker', namespace=ns, name='striker', output='screen',
-             remappings=TF_REMAP, parameters=[striker]),
-    ]
+                          'field_length': L, 'field_width': W, 'goal_width': G}, SIM]))
+        actions.append(Node(package='pinky_soccer_game', executable='striker', namespace=ns, name='striker',
+                            output='screen', remappings=TF_REMAP, parameters=[striker]))
     return GroupAction(scoped=True, actions=actions)
 
 
@@ -183,6 +186,8 @@ def launch_setup(context):
                  parameters=[{'field_length': L, 'field_width': W, 'goal_width': G, 'outer_strip': strip,
                               'match_control': True, 'win_score': int(v('win_score')),
                               'auto_ball_reset': v('auto_ball_reset').lower() == 'true',
+                              'drill': v('drill').lower() == 'true', 'drill_time': float(v('drill_time')),
+                              'game_mode': v('game_mode'),
                               'ready_offset': _start_offset(v), 'sim_backend': sim,
                               'yellow_initialpose_topic': '/yellow/initialpose'}, SIM]),
             Node(package='pinky_soccer_game', executable='match_ui', name='match_ui', output='screen',
@@ -208,7 +213,7 @@ def generate_launch_description():
         DeclareLaunchArgument('yellow_domain', default_value='37'),
         DeclareLaunchArgument('blue_domain', default_value='38'),
         DeclareLaunchArgument('backend', default_value='hsv', description='hsv (camera) | gt'),
-        DeclareLaunchArgument('max_speed', default_value='0.28', description='m/s, the real Pinky limit'),
+        DeclareLaunchArgument('max_speed', default_value='0.28', description='m/s top speed (moving to places; ball play itself is slower, ball_play.py)'),
         DeclareLaunchArgument('start_offset', default_value='line',
                               description="start pose from the own goal line [m]; 'line' = on the penalty line"),
         DeclareLaunchArgument('cam_tilt_deg', default_value='20'),
@@ -217,8 +222,8 @@ def generate_launch_description():
         DeclareLaunchArgument('record', default_value='',
                               description='video file (.mp4) recorded by the simulator itself, e.g. ~/pinky_rl/videos/match.mp4'),
         DeclareLaunchArgument('simple_robots', default_value='true'),     # true: viewer draws simple robot shapes (real time)   # true: referee moves the ball itself (tests)
-        DeclareLaunchArgument('turn_max', default_value='2.0', description='rad/s max turn rate (rule-based striker)'),
-        DeclareLaunchArgument('search_w', default_value='1.5', description='rad/s spin while looking for the ball'),
+        DeclareLaunchArgument('turn_max', default_value='1.0', description='rad/s max turn rate (rule-based striker)'),
+        DeclareLaunchArgument('search_w', default_value='1.6', description='rad/s spin while looking for the ball'),
         DeclareLaunchArgument('policy_yellow', default_value='',
                               description='RL policy .npz (pinky_soccer_rl.export) for yellow; empty = rules'),
         DeclareLaunchArgument('policy_blue', default_value='',
@@ -228,6 +233,11 @@ def generate_launch_description():
                                           'false: contact allowed'),
         DeclareLaunchArgument('ball_roll', default_value='0.00035', description='MuJoCo ball rolling friction [m]'),
         DeclareLaunchArgument('headless', default_value='false'),
+        # attack drill: yellow alone, the ball dropped at random spots, drill_time s to score each
+        DeclareLaunchArgument('game_mode', default_value='attack_defense',
+                              description='attack_defense (roles, 1-minute attacks) | free (both attack)'),
+        DeclareLaunchArgument('drill', default_value='false'),
+        DeclareLaunchArgument('drill_time', default_value='60'),
         DeclareLaunchArgument('sensor_view', default_value='true',
                               description='window: each robot camera + detection, lidar, sensor values'),
         OpaqueFunction(function=launch_setup),

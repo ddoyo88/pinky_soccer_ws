@@ -28,6 +28,25 @@ class MatchUiNode(Node):
         self.create_subscription(String, '/game/kickoff', self._kickoff, 10)
         self.goals = []                     # [(mm:ss, team, yellow, blue, kind)]
         self.create_subscription(String, '/game/goals', self._goals, 10)
+        self.attack_clock = ''              # 'YELLOW 12.3' : who attacks, seconds of attack time left
+        self.create_subscription(String, '/game/attack_clock', self._on_attack_clock, 10)
+        self.game_time = ''                 # match time 'mm:ss' (referee)
+        self.create_subscription(String, '/game/clock', self._on_game_clock, 10)
+        self.start_in, self.start_in_t = '', 0.0      # automatic start countdown (referee, while preparing)
+        self.create_subscription(String, '/game/start_in', self._on_start_in, 10)
+
+    def _on_start_in(self, msg):
+        import time as _t
+        with self.lock:
+            self.start_in, self.start_in_t = msg.data.strip(), _t.time()
+
+    def _on_game_clock(self, msg):
+        with self.lock:
+            self.game_time = msg.data.strip()
+
+    def _on_attack_clock(self, msg):
+        with self.lock:
+            self.attack_clock = msg.data.strip()
 
     def _goals(self, msg):
         rows = [ln.split('|') for ln in msg.data.splitlines() if ln.count('|') == 4]
@@ -58,6 +77,19 @@ class MatchUiNode(Node):
         with self.lock:
             return self.phase, self.score, self.last_event, self.kickoff, list(self.goals)
 
+    def clock(self):
+        with self.lock:
+            return self.attack_clock
+
+    def time_text(self):
+        with self.lock:
+            return self.game_time
+
+    def start_text(self):
+        import time as _t
+        with self.lock:
+            return self.start_in if _t.time() - self.start_in_t < 1.0 else ''
+
     def send_control(self, command):
         self.control_pub.publish(String(data=command))
 
@@ -75,10 +107,15 @@ class MatchWindow:
                  font=('DejaVu Sans', 12, 'bold'), fg='#a8bac8', bg='#101820').pack(pady=(18, 8))
         self.score_label = tk.Label(self.root, text='YELLOW  0  :  0  BLUE',
                                     font=('DejaVu Sans', 30, 'bold'), fg='white', bg='#101820')
-        self.score_label.pack(pady=8)
+        self.score_label.pack(pady=(8, 0))
+        self.time_label = tk.Label(self.root, text='경기 시간 00:00', font=('DejaVu Sans Mono', 15, 'bold'),
+                                   fg='#d3dce3', bg='#101820')
+        self.time_label.pack(pady=(0, 6))
         self.status_label = tk.Label(self.root, text='', font=('DejaVu Sans', 13, 'bold'),
                                      fg='#73d7a1', bg='#101820')
-        self.status_label.pack(pady=(4, 14))
+        self.status_label.pack(pady=(4, 4))
+        self.clock_label = tk.Label(self.root, text='', font=('DejaVu Sans', 16, 'bold'), fg='white', bg='#101820')
+        self.clock_label.pack(pady=(0, 10))
 
         controls = tk.Frame(self.root, bg='#101820')
         controls.pack(pady=4)
@@ -101,10 +138,14 @@ class MatchWindow:
         self.force_button = tk.Button(controls, text='바로 시작', command=self.force_start,
                                       bg='#b8860b', activebackground='#d4a017', **style)
         self.force_button.grid(row=1, column=0, pady=(8, 0), padx=6)
+        self.swap_button = tk.Button(controls, text='공수 교대', command=self.swap,
+                                     bg='#5b3a8a', activebackground='#7550ad', **style)
+        self.swap_button.grid(row=2, column=1, pady=(8, 0), padx=6)
         tk.Label(self.root, text='원위치: 문제가 생기면 로봇을 출발 위치로 돌리고 직전 킥오프부터 다시 (점수 유지)\n'
                                  '직전 골 취소: 잘못 감지된 골을 되돌리고 그 골 전 킥오프부터 다시\n'
                                  '바로 시작: 로봇·공이 어디 있든 지금 바로 경기 진행\n'
-                                 '공 가운데로: 경기 중 언제든 공만 센터로 (로봇·점수 그대로, 실물은 안내 + 소리)',
+                                 '공 가운데로: 경기 중 언제든 공만 센터로 (로봇·점수 그대로, 실물은 안내 + 소리)\n'
+                                 '공수 교대: 심판 판단으로 공격·수비를 바로 바꿈 (공은 그대로, 공격 시간 다시 60초)',
                  font=('DejaVu Sans', 9), fg='#7f93a3', bg='#101820', justify='center').pack(pady=(10, 0))
         self.event_label = tk.Label(self.root, text='', wraplength=540, justify='center',
                                     font=('DejaVu Sans', 10), fg='#d3dce3', bg='#101820')
@@ -142,8 +183,33 @@ class MatchWindow:
     def ball_centre(self):
         self.node.send_control('BALL_CENTRE')
 
+    def swap(self):
+        self.node.send_control('SWAP')
+
     def refresh(self):
         phase, (yellow, blue), event, kickoff, goals = self.node.snapshot()
+        clk = self.node.clock().split()
+        if len(clk) >= 2 and phase == 'START':
+            team, left = clk[0], float(clk[1])
+            name = '노랑' if team == 'YELLOW' else '파랑'
+            text = (f'{name} 공격' if left < 0 else
+                    f'{name} 공격  ·  공 터치 대기 ({left:.0f}초)' if len(clk) > 2 else
+                    f'{name} 공격  ·  남은 시간 {max(0.0, left):4.1f}초')
+            self.clock_label.configure(text=text, fg='#f5cc1f' if team == 'YELLOW' else '#6f95ff')
+        elif phase == 'PREPARE':
+            st = self.node.start_text().split()
+            if len(st) == 2 and st[0] == 'START':
+                self.clock_label.configure(text=f'자동 시작까지 {float(st[1]):.1f}초  (멈추려면 정지)', fg='#73d7a1')
+            elif len(st) == 2 and st[0] == 'MOVE':
+                self.clock_label.configure(text=f'출발 위치로 이동 중 - 늦어도 {st[1]}초 뒤 시작  (멈추려면 정지)',
+                                           fg='#73d7a1')
+            elif len(st) == 2:
+                self.clock_label.configure(text='자동 시작 대기 - 로봇 준비 / 공을 가운데에  (멈추려면 정지)',
+                                           fg='#73d7a1')
+            else:
+                self.clock_label.configure(text='')
+        else:
+            self.clock_label.configure(text='')
         if goals != self.shown_goals:
             self.shown_goals = goals
             self.goal_list.configure(state='normal')
@@ -158,6 +224,7 @@ class MatchWindow:
             self.goal_list.see('end')
             self.goal_list.configure(state='disabled')
         self.score_label.configure(text=f'YELLOW  {yellow}  :  {blue}  BLUE')
+        self.time_label.configure(text=f'경기 시간 {self.node.time_text() or "00:00"}')
         if phase == 'WAIT':
             status = '경기 시작 전'
         elif phase == 'PREPARE':

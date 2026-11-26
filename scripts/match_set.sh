@@ -10,10 +10,10 @@ source /opt/ros/jazzy/setup.bash && source "$WS/install/setup.bash"
 POL=${POLICY:-$HOME/pinky_rl/policy_final.npz}
 # its own process group (setsid): the whole sim (launch + every node) is stopped together afterwards
 # (a plain `kill -INT` does nothing here: background jobs of a script ignore SIGINT)
-setsid ros2 launch pinky_soccer_bringup sim_duel.launch.py yellow_domain:=47 blue_domain:=48 win_score:=$WIN auto_ball_reset:=true \
-    policy_yellow:=$POL policy_blue:=$POL "$@" > "$OUT/sim.log" 2>&1 &
+setsid ros2 launch pinky_soccer_bringup sim_duel.launch.py yellow_domain:=47 blue_domain:=48 win_score:=$WIN auto_ball_reset:=true "$@" \
+    > "$OUT/sim.log" 2>&1 &
 LP=$!
-python3 "$WS/scripts/match_watch.py" 47 48 35 1200 > "$OUT/watch.log" 2>&1
+python3 "$WS/scripts/match_watch.py" 47 48 35 "${DUR:-1200}" > "$OUT/watch.log" 2>&1   # DUR=s of watching
 kill -INT -- -$LP 2>/dev/null                       # like Ctrl-C on the whole group
 for i in $(seq 1 25); do
   pgrep -g $LP >/dev/null || break; sleep 1

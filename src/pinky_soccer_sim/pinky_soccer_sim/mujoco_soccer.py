@@ -359,6 +359,7 @@ class Robot:
         for flag in (mujoco.mjtRndFlag.mjRND_SHADOW, mujoco.mjtRndFlag.mjRND_REFLECTION):
             renderer.scene.flags[flag] = 0
         rgb = renderer.render()
+        self.last_rgb = rgb                              # for the match video (video_hud)
         img = Image()
         img.header.stamp, img.header.frame_id = now, 'front_camera_link'
         img.height, img.width, img.encoding, img.step = rgb.shape[0], rgb.shape[1], 'rgb8', rgb.shape[1] * 3
@@ -388,6 +389,22 @@ class SoccerSim:
         self.gt_pub = ref.create_publisher(TFMessage, '/gz/dynamic_pose', 10)
         ref.create_subscription(PoseStamped, '/sim/set_pose', self._set_pose, 10)
         self.pending_poses = []
+        # match information for the recorded video (--record): score, attack clock, referee messages
+        self.hud_info = {'score': (0, 0), 'clock': '', 'events': [], 'phase': ''}
+
+        def _score(m):
+            import re
+            g = re.fullmatch(r'YELLOW\s+(\d+)\s*-\s*(\d+)\s+BLUE', m.data.strip())
+            if g:
+                self.hud_info['score'] = (int(g.group(1)), int(g.group(2)))
+
+        def _event(m):
+            self.hud_info['events'] = (self.hud_info['events'] + [m.data])[-2:]
+        ref.create_subscription(String, '/game/score', _score, 10)
+        ref.create_subscription(String, '/game/attack_clock', lambda m: self.hud_info.__setitem__('clock', m.data), 10)
+        ref.create_subscription(String, '/game/event', _event, 10)
+        ref.create_subscription(String, '/game/phase', lambda m: self.hud_info.__setitem__('phase', m.data.strip()), 10)
+        ref.create_subscription(String, '/game/clock', lambda m: self.hud_info.__setitem__('time', m.data.strip()), 10)
         # front LCD pictures: flag normally, the goal picture while the robot celebrates its goal
         self.screens = {}
         for team in self.robots:
@@ -513,6 +530,7 @@ def main(args=None):
     ap.add_argument('--record', default='', help='write the match to this video file (.mp4)')
     ap.add_argument('--record-fps', type=float, default=20.0)
     ap.add_argument('--record-size', default='960x540')
+    ap.add_argument('--record-plain', action='store_true', help='video without the match information overlay')
     ap.add_argument('--viewer-hz', type=float, default=10.0, help='viewer redraws per wall second')
     ap.add_argument('--field-style', default='hardboard')
     ap.add_argument('--yellow-domain', type=int, default=37)
@@ -542,6 +560,15 @@ def main(args=None):
     cw, ch = (int(v) for v in opt.cam_size.lower().split('x'))
     camera = None if opt.no_camera else {'width': cw, 'height': ch, 'fps': opt.cam_fps}
     sim = SoccerSim(model, {'yellow': opt.yellow_domain, 'blue': opt.blue_domain}, settings, camera)
+    # Ctrl-C / launch shutdown (SIGINT, SIGTERM): leave the main loop normally, so the recorded video is finished
+    # (rclpy's own handler only shut the ROS contexts down - the loop ran on and the .mp4 stayed unplayable)
+    import signal
+    stop = {'now': False}
+
+    def _stop(*_):
+        stop['now'] = True
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
     viewer = None
     try:
         if opt.viewer:
@@ -574,11 +601,14 @@ def main(args=None):
             path = os.path.expanduser(opt.record)
             os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
             rec = {'w': cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), opt.record_fps, (rw, rh)),
-                   'r': mujoco.Renderer(model, rh, rw), 't': -1e9, 'cv2': cv2}
+                   'r': mujoco.Renderer(model, rh, rw), 't': -1e9, 'cv2': cv2, 'hud': None}
+            if not opt.record_plain:
+                from pinky_soccer_sim.video_hud import VideoHud
+                rec['hud'] = VideoHud(rw, rh)          # score, attack clock, referee messages, robot cameras
             print(f'recording the match to {path} ({rw}x{rh} @ {opt.record_fps:g} fps of simulation time)',
                   flush=True)
         prof_t, prof_sim = time.monotonic(), sim.data.time
-        while viewer is None or viewer.is_running():
+        while (viewer is None or viewer.is_running()) and not stop['now']:
             ta = time.perf_counter()
             sim.spin_ros()
             tb = time.perf_counter()
@@ -588,7 +618,12 @@ def main(args=None):
             if rec is not None and sim.data.time - rec['t'] >= 1.0 / opt.record_fps - 1e-9:
                 rec['t'] = sim.data.time
                 rec['r'].update_scene(sim.data, camera=rcam, scene_option=ropt)
-                rec['w'].write(rec['cv2'].cvtColor(rec['r'].render(), rec['cv2'].COLOR_RGB2BGR))
+                frame = rec['r'].render()
+                if rec['hud'] is not None:
+                    cams = {t: getattr(r, 'last_rgb', None) for t, r in sim.robots.items()}
+                    rec['w'].write(rec['hud'].compose(frame, cams, sim.hud_info))
+                else:
+                    rec['w'].write(rec['cv2'].cvtColor(frame, rec['cv2'].COLOR_RGB2BGR))
             if viewer and time.monotonic() - getattr(sim, 'view_t', 0.0) >= 1.0 / opt.viewer_hz:
                 sim.view_t = time.monotonic()
                 viewer.sync()

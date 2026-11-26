@@ -33,10 +33,14 @@ for ln in watch:
             events['ball out -> centre + swap'] += 1
         elif '(자동 테스트)' in e:
             events['(test) stuck ball -> centre + swap'] += 1
+        elif '닿지 못함' in e:
+            events['swap: attacker never reached the ball (30 s)'] += 1
+        elif '공격 시간' in e:
+            events['swap: attack time up'] += 1
         elif '공 뺏음' in e:
             events['swap: defender won the ball'] += 1
         elif e.startswith('공수 교대:'):
-            events['swap: centre line / out'] += 1
+            events['swap events (all)'] += 1
         elif '경기 시작 - 가운데 공, 노랑' in e and start_t is None:
             start_t = t
     elif 'PHASE' in rest and 'FINISHED' in rest:

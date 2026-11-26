@@ -66,6 +66,25 @@ class Referee(Node):
         # attack / defence game (2026-11-25): one robot attacks, the other defends its goal; the roles swap when
         # the ball crosses the centre line into the attacker's own half; after a goal the conceding team attacks
         self.declare_parameter('game_mode', 'attack_defense')        # or 'free' (both always attack)
+        # attack / defence rules (user, 2026-11-26): the referee decides the roles - yellow attacks first, the
+        # conceding team after a goal, a swap when the ball goes out (it goes back to the centre), and after
+        # attack_time s of attack (the ball stays where it is).  The older automatic swaps are off by default.
+        self.declare_parameter('attack_time', 60.0)        # 1 minute per attack (user, back on 2026-11-26)        # s per attack, 0 = no timer - counted from the
+                                                           # attacker's first touch of the ball (user, option B)
+        self.declare_parameter('swap_on_centre_line', False)
+        # trial rule (user, 2026-11-26): the half the ball is in decides - ball in yellow's half -> blue attacks,
+        # in blue's half -> yellow attacks (5 cm past the centre line, so it does not flicker on the line)
+        self.declare_parameter('swap_by_half', False)
+        # every swap (user, 2026-11-27): both robots first go to their own places fast - the attacker to its start
+        # pose (or just behind the ball when it lies there), the defender in front of its goal - then play on
+        self.declare_parameter('regroup_all', True)   # trial rule, off again
+        self.declare_parameter('drill', False)             # attack drill: yellow alone, random balls
+        # timed match (user, 2026-11-26): match_time s of play, more goals wins; a draw -> golden goal (the next
+        # goal wins).  win_score then does not end the match early.  0 = first to win_score as before
+        self.declare_parameter('match_time', 600.0)
+        self.declare_parameter('drill_time', 60.0)         # s per drill round
+        self.declare_parameter('drill_rounds', 10)
+        self.declare_parameter('swap_on_ball_win', False)
         self.declare_parameter('wall_zone', 0.08)          # m: ball this close to the boundary LINE (or beyond
                                                            # it; the robots must not cross the line) ...
         self.declare_parameter('wall_stuck_time', 3.0)     # ... and not moving this long -> centre (robots
@@ -138,6 +157,17 @@ class Referee(Node):
         # /game/attack: 'YELLOW' / 'BLUE' = that team attacks, the other defends; '<TEAM>_KICKOFF' = that team
         # goes to the ball, the other waits until it is touched; 'FREE' = both attack (old game)
         self.pub_attack = self.create_publisher(String, '/game/attack', 10)
+        self.pub_attack_clock = self.create_publisher(String, '/game/attack_clock', 10)
+        self.pub_game_clock = self.create_publisher(String, '/game/clock', 10)   # match time mm:ss
+        # automatic start countdown for the match window: 'MOVE <s>' robots on the way to their start poses (start
+        # at the latest after <s>), 'START <s>' ball placed, kick-off in <s>; '' otherwise
+        self.pub_start_in = self.create_publisher(String, '/game/start_in', 10)
+        # the robots' own camera sightings of the ball (relayed): 'nobody can find the ball'
+        from geometry_msgs.msg import PointStamped as _PS
+        self.robot_ball_t = time.time()
+        for topic in ('/yellow/ball/position_map', '/blue/ball/position_map'):
+            self.create_subscription(_PS, topic, lambda m: setattr(self, 'robot_ball_t', time.time()), 10)
+        self.attack_t0 = time.time()
         self.attack, self.attack_touched, self.next_attack = 'YELLOW', False, 'YELLOW'
         self.robot_state = {}                                                # team -> (state, time)
         for team, topic in (('YELLOW', '/yellow/game/state'), ('BLUE', '/blue/game/state'),
@@ -186,6 +216,7 @@ class Referee(Node):
             self.last_goal = None
             self.goals = []
             self.game_t0 = time.time()
+            self.golden = False
             self._publish_score()
             self.kickoff, self.after_goal = 'YELLOW', False
             self.next_attack = 'YELLOW'                   # first attack: yellow
@@ -223,10 +254,15 @@ class Referee(Node):
                 self._publish_score()
             if not self.goals and self.match_phase in ('WAIT', 'FINISHED'):
                 self.game_t0 = time.time()
+                self.golden = False
             self.place_pending = False
             self.kickoff = 'OPEN'
             self._event('바로 시작! - 지금 위치에서 경기 진행')
             self._start()
+        elif cmd == 'SWAP':                            # match window button: the referee swaps the roles
+            if self._attack_mode() and self.match_phase == 'START':
+                self._attack_turnover()
+                self._event('심판 판단: 공수 교대 (공은 그대로)')
         elif cmd == 'BALL_CENTRE':                     # match window button: only the ball to the centre spot
             self.ball_request_t = time.time()
             if self._centre_ball('공 가운데로 (버튼) - 로봇·점수 그대로, 경기 계속'):
@@ -274,7 +310,14 @@ class Referee(Node):
         return True
 
     def _tick_prepare(self, now):
-        timeout = now - self.phase_t0 > self.get_parameter('prepare_timeout').value
+        timeout = now - self.phase_t0 > (3.0 if self.get_parameter('drill').value       # drill: blue never gets
+                                         else self.get_parameter('prepare_timeout').value)  # ready - start at once
+        limit = 3.0 if self.get_parameter('drill').value else self.get_parameter('prepare_timeout').value
+        if self.placed_t is None:
+            self.pub_start_in.publish(String(data=f'MOVE {max(0.0, limit - (now - self.phase_t0)):.0f}'))
+        else:
+            self.pub_start_in.publish(String(data='START %.1f' % max(
+                0.0, self.get_parameter('start_delay').value - (now - self.placed_t))))
         if self.placed_t is None:
             if self._robots_ready() or timeout:
                 if timeout:
@@ -296,6 +339,11 @@ class Referee(Node):
             self.attack_touched = immediate
             self.half_prev = 0
             self.swap_t = time.time()
+            self.regroup_t0 = None
+            self.attack_t0 = time.time()                 # a fresh attack time for the new attacker ...
+            self.clock_running = False                   # ... starting with its first touch of the ball
+            if self.get_parameter('regroup_all').value:
+                self.regroup_t0 = time.time()            # first to their places, then play
             other = '노랑' if self.attack == 'BLUE' else '파랑'
             self._event(f'공수 교대: {"노랑" if self.attack == "YELLOW" else "파랑"} 공격 / {other} 수비')
 
@@ -308,11 +356,55 @@ class Referee(Node):
             touched = math.hypot(bx, by) > 0.06 or (p is not None and math.hypot(p[0] - bx, p[1] - by) < 0.13)
             if touched:
                 self.attack_touched = True
+                self.attack_t0 = time.time()
+                self.clock_running = True
                 other = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
                 self._event(f'{name[self.attack]} 공격 / {name[other]} 수비')
             return
         if abs(bx) > self.L / 2 + 0.01 or abs(by) > self.W / 2 + 0.01:
             return                       # ball out: the out rule has swapped the roles already (r: ad2 double swap)
+        at = self.get_parameter('attack_time').value
+        if getattr(self, 'regroup_t0', None) is not None:
+            return                       # both robots on their way to their own half
+        if self.get_parameter('swap_by_half').value:
+            want = 'BLUE' if bx < -0.05 else ('YELLOW' if bx > 0.05 else self.attack)
+            if want != self.attack:
+                self._attack_turnover()
+                self._event(f'공이 {"노랑" if want == "BLUE" else "파랑"} 진영으로 - '
+                            f'{"파랑" if want == "BLUE" else "노랑"} 공격')
+                return
+        if at > 0 and not getattr(self, 'clock_running', True):
+            # the attack clock starts at the attacker's first touch (within 0.14 m of the ball); before that the
+            # time it needs to get to the ball does not count
+            ap = self.tracker.get('pinky_yellow' if self.attack == 'YELLOW' else 'pinky_blue')
+            if ap is not None and math.hypot(ap[0] - bx, ap[1] - by) < 0.14:
+                self.clock_running, self.attack_t0 = True, time.time()
+            else:
+                return
+        if at > 0 and time.time() - self.attack_t0 > at and not getattr(self, 'out_pending', False):
+            # attack time up with the ball in the field: the ball stays, the roles swap - the attacker runs back
+            # to its goal at full speed, the defender takes the ball on
+            # the ball stays where it is - unless nobody can find it, or it lies still next to a goal or on a
+            # line (user, 2026-11-26): then it goes back to the centre spot
+            now_t = time.time()
+            lost = now_t - self.robot_ball_t > 3.0
+            still = self.last_move_t is not None and now_t - self.last_move_t > 2.0
+            near_goal = min(math.hypot(bx - gx, by) for gx in (-self.L / 2, self.L / 2)) < 0.30
+            on_line = self.W / 2 - abs(by) < 0.06 or (self.L / 2 - abs(bx) < 0.06 and abs(by) > self.G / 2 - 0.03)
+            self._attack_turnover()
+            if lost or (still and (near_goal or on_line)):
+                why = '공을 찾을 수 없음' if lost else ('골대 근처에 멈춤' if near_goal else '라인에 멈춤')
+                if self._centre_ball(f'공격 시간 {at:.0f}초 끝 ({why}) - 공을 가운데로, 공수 교대'):
+                    self.last_ball, self.last_move_t = None, now_t
+                    self.attack_t0, self.clock_running = now_t, False
+                    return
+            # the ball stays: both robots first go back to their own half (the new attacker to its start pose,
+            # or just behind the ball when that lies there), then play on (user, 2026-11-26)
+            self.regroup_t0 = now_t
+            self._event(f'공격 시간 {at:.0f}초 끝 - 공은 그대로, 공수 교대: 각자 자기 진영으로')
+            return
+        if not self.get_parameter('swap_on_ball_win').value and not self.get_parameter('swap_on_centre_line').value:
+            return
         # the defender wins the ball: the ball at its nose, moving away from its goal, for 0.7 s -> it attacks
         # now and the attacker has to run back at once (user: 'yellow should hurry back to its goal')
         dteam = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
@@ -322,7 +414,8 @@ class Referee(Node):
         self.poss_ball = (bx, by)
         moving_away = prev is not None and (bx - prev[0]) * away > 0.002
         settled = time.time() - getattr(self, 'swap_t', 0.0) > 3.0      # no ping-pong: 3 s after any swap
-        if dp is not None and math.hypot(dp[0] - bx, dp[1] - by) < 0.14 and moving_away and settled:
+        if self.get_parameter('swap_on_ball_win').value and dp is not None and \
+                math.hypot(dp[0] - bx, dp[1] - by) < 0.14 and moving_away and settled:
             self.poss_t = getattr(self, 'poss_t', None) or time.time()
             if time.time() - self.poss_t > 1.0:
                 self.poss_t = None
@@ -341,7 +434,7 @@ class Referee(Node):
         prev = getattr(self, 'half_prev', 0)
         self.half_prev = side if side != 0 else prev
         back = side == own and prev == -own
-        if back:
+        if back and self.get_parameter('swap_on_centre_line').value:
             self.swap_t = time.time()
             self.attack = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
             other = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
@@ -353,6 +446,8 @@ class Referee(Node):
             self.kickoff_spot = (ball[0], ball[1]) if ball else None
         self.kickoff_t0 = time.time()
         self.attack, self.attack_touched = self.next_attack, False
+        self.clock_running = False
+        self.regroup_t0 = None
         self.half_prev = 0
         self.last_ball = None
         self.last_move_t = time.time()
@@ -361,9 +456,9 @@ class Referee(Node):
         if self.kickoff != 'OPEN':
             self._event(f'경기 시작 - {self.kickoff} 킥오프')
         elif not self.goals:
-            self._event('경기 시작 - 가운데 공, 노랑 선공 (파랑은 3초 뒤 출발)')
+            self._event('경기 시작 - 가운데 공, 노랑 선공 (파랑은 2초 뒤 출발)')
         else:
-            self._event('경기 시작 - 가운데 공 (직전 득점 팀은 3초 뒤 출발)')
+            self._event('경기 시작 - 가운데 공 (직전 득점 팀은 2초 뒤 출발)')
 
     def _goal(self, team, now):
         """Counted automatically; the conceding team kicks off from the centre spot."""
@@ -401,12 +496,13 @@ class Referee(Node):
         self.robot_state.pop(team, None)
         self.pub_goal.publish(String(data=team))
         self._set_phase('GOAL')
-        if win > 0 and max(self.yellow, self.blue) >= win:
-            self.finish_after_goal = f'{line}  -  경기 종료, {name} 승리!'
+        timed = self.get_parameter('match_time').value > 0
+        if (timed and getattr(self, 'golden', False)) or (not timed and win > 0 and max(self.yellow, self.blue) >= win):
+            self.finish_after_goal = f'{line}  -  {"골든골! " if timed else ""}경기 종료, {name} 승리!'
             self._event(f'{line}  -  {name} 세레모니 후 경기 종료')
         else:
             self.finish_after_goal = None
-            self._event(f'{line}  -  {name} 세레모니 (제자리 3바퀴), 그 다음 가운데에서 다시 시작')
+            self._event(f'{line}  -  {name} 세레모니 (제자리 1바퀴), 그 다음 가운데에서 다시 시작')
 
     def _celebration_over(self, now):
         """The scorer reported CELEBRATE_DONE (after at least goal_pause), or the timeout ran out."""
@@ -518,6 +614,76 @@ class Referee(Node):
     def _respot(self, x=0.0, y=0.0):
         self._set_model_pose('golf_ball', x, y, self.r + 0.003, 0.0)
 
+    def _drill_tick(self, now, bx, by):
+        """Attack drill (user, 2026-11-26): yellow alone (blue parked outside the field, no striker), the ball
+        dropped at a random spot, yellow has drill_time s to score in blue's goal.  Goal = success, time up or
+        ball out = miss; then the next random ball.  Results go to the event log ('연습 N: ...')."""
+        import random
+        self.attack, self.attack_touched, self.regroup_t0 = 'YELLOW', True, None
+        if not getattr(self, 'drill_parked', False):
+            self.drill_parked = True
+            self._set_model_pose('pinky_blue', 0.0, -(self.W / 2 + self.get_parameter('outer_strip').value * 0.6),
+                                 0.03, 0.0)
+            self.drill_n, self.drill_ok, self.drill_times = 0, 0, []
+            self.drill_t0 = None
+        # rounds of drill_time s (user, 2026-11-26): a random ball at the start of each round; a goal or an out ->
+        # the next random ball at once (1 s pause), the clock keeps running; count the goals per round
+        rounds = int(self.get_parameter('drill_rounds').value)
+        limit = self.get_parameter('drill_time').value
+        if getattr(self, 'drill_done', False):
+            return
+        if self.drill_t0 is None:                           # a new round
+            self.drill_t0, self.drill_goals = now, 0
+            self.drill_n += 1
+            self.drill_next = now                            # ball now
+            self._event(f'연습 {self.drill_n}/{rounds} 시작 - {limit:.0f}초 동안 몇 골?')
+        if self.drill_next is not None:
+            if now < self.drill_next:
+                return
+            yp = self.tracker.get('pinky_yellow')
+            for _ in range(50):                             # random spot inside the field, away from the robot
+                x = random.uniform(-self.L / 2 + 0.15, self.L / 2 - 0.15)
+                y = random.uniform(-self.W / 2 + 0.12, self.W / 2 - 0.12)
+                if yp is None or math.hypot(x - yp[0], y - yp[1]) > 0.30:
+                    break
+            self._respot(x, y)
+            self.drill_next, self.drill_ball_t = None, now
+            return
+        if now - self.drill_t0 > limit:                     # round over
+            self.drill_times.append(self.drill_goals)
+            total = sum(self.drill_times)
+            self._event(f'연습 {self.drill_n}/{rounds} 끝: {self.drill_goals}골  -  지금까지 {total}골 '
+                        f'({self.drill_n}판, 판당 {total / self.drill_n:.1f}골)')
+            if self.drill_n >= rounds:
+                self.drill_done = True
+                self._event(f'연습 종료: {rounds}판 {total}골, 판별 {self.drill_times}')
+                return
+            self.drill_t0 = None
+            return
+        if now - self.drill_ball_t < 1.0:
+            return                                          # (the ball position lags the re-spot)
+        goal = bx > self.L / 2 + 0.01 and abs(by) < self.G / 2
+        out = not goal and (abs(bx) > self.L / 2 + 0.01 or abs(by) > self.W / 2 + 0.01)
+        # a ball stuck on a line for 5 s (no robot can get behind it without crossing the line) -> dropped again,
+        # like the referee button in a match
+        on_line = self.W / 2 - abs(by) < 0.06 or (self.L / 2 - abs(bx) < 0.06 and abs(by) > self.G / 2)
+        ref = getattr(self, 'drill_line_ref', None)
+        if not on_line or ref is None or math.hypot(bx - ref[0], by - ref[1]) > 0.02:
+            self.drill_line_ref = (bx, by, now)
+        elif now - ref[2] > 5.0:
+            self.drill_line_ref = None
+            self._event('공이 라인에 붙어 꺼낼 수 없음 - 다시 놓음')
+            self.drill_next = now + 1.0
+            return
+        if goal or out:
+            if goal:
+                self.drill_goals += 1
+                self.drill_ok += 1
+                self._event(f'골! (연습 {self.drill_n}: {self.drill_goals}골째, {now - self.drill_t0:.0f}초)')
+            else:
+                self._event('공이 밖으로 나감 - 다시 놓음')
+            self.drill_next = now + 1.0                     # the next random ball
+
     def _try_place_kickoff_ball(self):
         """After a goal: centre spot.  Match start: kickoff_gap in front of the kicking robot's bumper, where
         the robot actually stands (its start pose within the READY tolerance)."""
@@ -560,10 +726,88 @@ class Referee(Node):
                 return False
         self._respot(0.0, 0.0)
         self._event(why)
+        self.closer_pending = True          # next tick: the robot closer to the ball takes it (after any swap)
         return True
+
+    def _regroup_tick(self, now):
+        """Regroup after a time-up swap: over when the attacker stands on its spot and the defender is in its own
+        half (or after 10 s); the attack clock then waits for the attacker's first touch as usual."""
+        from pinky_soccer_game.ball_play import regroup_spot
+        if self.match_phase != 'START':
+            self.regroup_t0 = None
+            return
+        att = 'pinky_yellow' if self.attack == 'YELLOW' else 'pinky_blue'
+        dfn = 'pinky_blue' if self.attack == 'YELLOW' else 'pinky_yellow'
+        a, d, ball = self.tracker.get(att), self.tracker.get(dfn), self.tracker.get('golf_ball')
+        own_x = -self.L / 2 if self.attack == 'YELLOW' else self.L / 2
+        ok = False
+        if a is not None and d is not None and ball is not None:
+            sx, sy = regroup_spot(own_x, (ball[0], ball[1]), self.L / 2, self.W / 2,
+                                  self.get_parameter('ready_offset').value)
+            d_own = -self.L / 2 if dfn == 'pinky_yellow' else self.L / 2
+            ok = math.hypot(a[0] - sx, a[1] - sy) < 0.08 and abs(d[0] - d_own) < 0.60
+        if ok or now - self.regroup_t0 > 12.0:
+            self.regroup_t0 = None
+            self.attack_t0, self.clock_running = now, False
+            name = {'YELLOW': '노랑', 'BLUE': '파랑'}
+            self._event(f'자리 잡기 끝 - {name[self.attack]} 공격 시작')
+
+    def _attack_to_closer(self):
+        """Ball (re)placed on the centre spot (user, 2026-11-26): the robot closer to it goes to the ball (attacks),
+        the one further away backs off (defends, back to its goal).  Within 5 cm of a tie the roles stay as the
+        other rules set them (after a goal both stand on their start poses: the conceding team attacks)."""
+        if not self._attack_mode() or self.match_phase != 'START' or self.get_parameter('regroup_all').value:
+            return                                       # (regroup_all: everybody goes to its place instead)
+        y, b = self.tracker.get('pinky_yellow'), self.tracker.get('pinky_blue')
+        if y is None or b is None:
+            return
+        dy, db = math.hypot(y[0], y[1]), math.hypot(b[0], b[1])
+        if abs(dy - db) < 0.05:
+            return
+        closer = 'YELLOW' if dy < db else 'BLUE'
+        if closer != self.attack:
+            self.attack = closer
+            self.attack_touched = True
+            self.half_prev = 0
+            self.swap_t = self.attack_t0 = time.time()
+            self.clock_running = False
+            name = {'YELLOW': '노랑', 'BLUE': '파랑'}
+            other = 'BLUE' if closer == 'YELLOW' else 'YELLOW'
+            self._event(f'가운데 공: 가까운 {name[closer]} 공격 / 먼 {name[other]} 수비 (뒤로)')
+
+    def _check_match_time(self, now):
+        """Timed match: at match_time the team ahead wins; a draw goes on as golden goal."""
+        mt = self.get_parameter('match_time').value
+        if mt <= 0 or self.match_phase != 'START' or getattr(self, 'golden', False) or now - self.game_t0 < mt:
+            return
+        if self.yellow != self.blue:
+            win = '노랑' if self.yellow > self.blue else '파랑'
+            self._set_phase('FINISHED')
+            self._event(f'{int(mt // 60)}분 종료  {self.yellow} : {self.blue}  -  경기 종료, {win} 승리!')
+        else:
+            self.golden = True
+            self._event(f'{int(mt // 60)}분 종료  {self.yellow} : {self.blue} 동점  -  골든골! 다음 골을 넣는 팀이 승리')
+
+    def _publish_game_clock(self, now):
+        """Match time (mm:ss since NEW_GAME) for the match window and the video; stands still once finished."""
+        ph = self.match_phase
+        if ph in ('WAIT',):
+            text = '00:00'
+        elif ph == 'FINISHED':
+            text = getattr(self, 'clock_text', '00:00')
+        else:
+            t = int(max(0.0, now - self.game_t0))
+            text = f'{t // 60:02d}:{t % 60:02d}'
+        self.clock_text = text
+        self.pub_game_clock.publish(String(data=text))
 
     def tick(self):
         now = time.time()
+        self._publish_game_clock(now)
+        self._check_match_time(now)
+        if getattr(self, 'closer_pending', False):
+            self.closer_pending = False
+            self._attack_to_closer()
         req = getattr(self, 'ball_request_t', None)
         if req is not None:                            # button pressed while a robot stood on the centre spot
             if self._centre_ball('공 가운데로 (버튼) - 로봇·점수 그대로, 경기 계속'):
@@ -576,8 +820,20 @@ class Referee(Node):
                 self._event('공 가운데로: 센터에 로봇이 있어서 옮기지 못함 - 다시 눌러 주세요')
         if self.match_control:
             self.pub_kickoff.publish(String(data=self.kickoff))
+            if getattr(self, 'regroup_t0', None) is not None:
+                self._regroup_tick(now)
+            regroup = getattr(self, 'regroup_t0', None) is not None
             self.pub_attack.publish(String(data='FREE' if not self._attack_mode() else
-                                           self.attack + ('' if self.attack_touched else '_KICKOFF')))
+                                           self.attack + ('_REGROUP' if regroup else
+                                                          '' if self.attack_touched else '_KICKOFF')))
+            if self._attack_mode() and self.match_phase == 'START':
+                at = self.get_parameter('attack_time').value
+                running = at > 0 and self.attack_touched and getattr(self, 'clock_running', True)
+                left = at - (now - self.attack_t0) if running else at
+                if at <= 0:
+                    self.pub_attack_clock.publish(String(data=f'{self.attack} -1'))      # no attack timer
+                else:
+                    self.pub_attack_clock.publish(String(data=f'{self.attack} {left:.1f}' + ('' if running else ' WAIT')))
             if self.match_phase in ('PREPARE', 'START', 'GOAL'):   # GOAL: the scorer may be stuck in there
                 self._check_goal_jam(now)
             if self.match_phase == 'START':
@@ -597,6 +853,9 @@ class Referee(Node):
         if ball is None:
             return
         bx, by = ball[0], ball[1]
+        if self.get_parameter('drill').value and self.match_phase == 'START':
+            self._drill_tick(now, bx, by)
+            return
         if self._attack_mode() and self.match_phase == 'START':
             self._attack_tick(bx, by)
 
@@ -655,6 +914,8 @@ class Referee(Node):
                 if pending and now - self.out_t > 1.0:
                     if self._centre_ball('나간 공 -> 가운데, 경기 계속'):
                         self.last_ball, self.last_move_t = None, now
+                        self.attack_t0 = time.time()       # (the clock waits for the new attacker's touch)
+                        self.clock_running = False
                         self.out_pending = False
                         out = False
                 self.out_called = out
@@ -668,9 +929,10 @@ class Referee(Node):
                     self._event('공이 라인에 붙어 로봇이 꺼낼 수 없음 - 심판 판단: "공 가운데로" 버튼')
                 # unattended test runs (auto_ball_reset): what the person would do - the stuck ball (5 s on a line,
                 # 15 s anywhere) back to the centre, the roles swap like after the button
+                # (the 15 s 'still anywhere' reset is gone: the attack timer swaps the roles instead)
                 if auto and not out and self.last_move_t is not None and (
                         (getattr(self, 'line_called', False) and now - self.last_move_t > 5.0) or
-                        now - self.last_move_t > 15.0):
+                        now - self.last_move_t > 45.0):
                     if self._centre_ball('(자동 테스트) 멈춘 공 -> 가운데, 공수 교대'):
                         self.last_ball, self.last_move_t, self.line_called = None, now, False
                         self._attack_turnover()

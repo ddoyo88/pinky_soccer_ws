@@ -64,6 +64,10 @@ class RealReferee(Node):
                                         # cross the line - goal mouths excepted) ...
         P('wall_stuck_time', 3.0)       # ... lying still this long -> ask for the ball on the centre spot
         P('game_mode', 'attack_defense')   # attack / defence game (like the sim referee) or 'free'
+        P('match_time', 600.0)             # s of play, more goals wins, a draw -> golden goal; 0 = first to win_score
+        P('attack_time', 60.0)             # s per attack (the ball stays, the roles swap), 0 = off - counted from
+                                           # the attacker's first touch (the ball starts moving)
+        P('swap_on_centre_line', False)    # older automatic swap, off: the referee rules decide
         P('stuck_time', 10.0)           # ball not moving at all this long anywhere (deadlock) -> same
                                         # (robots play on: nobody can get behind a ball on the wall)
         self.L = self.get_parameter('field_length').value
@@ -90,6 +94,7 @@ class RealReferee(Node):
         # attack / defence game: who attacks, has the kick-off been touched, who attacks after the next start
         self.attack, self.attack_touched, self.next_attack = 'YELLOW', False, 'YELLOW'
         self.half_prev, self.out_pending, self.out_armed = 0, False, True
+        self.clock_running, self.clock_ref = False, None
 
         self.pub_control = self.create_publisher(String, '/game/control', 10)
         self.pub_phase = self.create_publisher(String, '/game/phase', 10)
@@ -100,6 +105,10 @@ class RealReferee(Node):
         self.pub_fx = self.create_publisher(String, '/game/fx', 10)
         self.pub_goal = self.create_publisher(String, '/game/goal', 10)
         self.pub_attack = self.create_publisher(String, '/game/attack', 10)
+        self.pub_attack_clock = self.create_publisher(String, '/game/attack_clock', 10)
+        self.pub_game_clock = self.create_publisher(String, '/game/clock', 10)   # match time mm:ss
+        self.pub_start_in = self.create_publisher(String, '/game/start_in', 10)   # automatic start countdown
+        self.attack_t0 = time.time()
         self.celebration_seen = False
         self.finish_after_goal = None
         if self.get_parameter('sim_backend').value == 'mujoco':
@@ -249,6 +258,7 @@ class RealReferee(Node):
             self.yellow = self.blue = 0
             self.goals = []
             self.game_t0 = time.time()
+            self.golden = False
             self.next_attack = 'YELLOW'                   # first attack: yellow
             self._event('새 경기 - 노랑이 자기 골대 앞으로 갑니다')
             self._prepare()
@@ -285,6 +295,10 @@ class RealReferee(Node):
                 if not self.out_pending:
                     self._attack_turnover()               # (an out has swapped the roles already)
                 self.out_pending = False
+        elif cmd == 'SWAP':                            # match window button: the referee swaps the roles
+            if self._attack_mode() and self.phase == 'START':
+                self._attack_turnover()
+                self._event('심판 판단: 공수 교대 (공은 그대로)')
         elif cmd == 'STOP':
             self._set_phase('WAIT')
             self._event('경기 중지')
@@ -335,16 +349,17 @@ class RealReferee(Node):
         self.next_attack = 'BLUE' if team == 'YELLOW' else 'YELLOW'      # the conceding team attacks next
         self.pub_goal.publish(String(data=team))
         self.celebration_seen = False
-        if win > 0 and max(self.yellow, self.blue) >= win:
+        timed = self.get_parameter('match_time').value > 0
+        if (timed and getattr(self, 'golden', False)) or (not timed and win > 0 and max(self.yellow, self.blue) >= win):
             self.pub_fx.publish(String(data='FINISHED'))
-            self.finish_after_goal = f'{line}  -  경기 종료, {name} 승리!'
+            self.finish_after_goal = f'{line}  -  {"골든골! " if timed else ""}경기 종료, {name} 승리!'
             self._set_phase('GOAL')
             self._event(f'{line}  -  세레모니 후 경기 종료')
         else:
             self.pub_fx.publish(String(data='GOAL'))
             self.finish_after_goal = None
             self._set_phase('GOAL')
-            self._event(f'{line}  -  세레모니(제자리 3바퀴) 후 출발 위치로, 공을 가운데에 놓아 주세요')
+            self._event(f'{line}  -  세레모니(제자리 1바퀴) 후 출발 위치로, 공을 가운데에 놓아 주세요')
 
     # ------------------------------------------------------------------ attack / defence game
     def _attack_mode(self):
@@ -352,11 +367,15 @@ class RealReferee(Node):
 
     def _attack_start(self):
         self.attack, self.attack_touched = self.next_attack, False
+        self.attack_t0 = time.time()
+        self.clock_running, self.clock_ref = False, None
         self.half_prev, self.out_pending, self.out_armed = 0, False, True
 
     def _attack_turnover(self):
         self.attack = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
         self.attack_touched, self.half_prev = True, 0
+        self.attack_t0 = time.time()
+        self.clock_running, self.clock_ref = False, None
         name = {'YELLOW': '노랑', 'BLUE': '파랑'}
         other = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
         self._event(f'공수 교대: {name[self.attack]} 공격 / {name[other]} 수비')
@@ -371,12 +390,16 @@ class RealReferee(Node):
         if not self.attack_touched:
             if math.hypot(x, y) > 0.08:
                 self.attack_touched = True
+                self.attack_t0 = now
+                self.clock_running = True
                 other = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
                 self._event(f'{name[self.attack]} 공격 / {name[other]} 수비')
             return
         out = abs(y) > self.W / 2 + 0.02 or (abs(x) > self.L / 2 + 0.02 and abs(y) >= self.G / 2)
         if self.out_pending and math.hypot(x, y) < 0.12:
             self.out_pending = False                         # put back on the spot by hand (no button)
+            self.attack_t0 = now                             # (the clock waits for the new attacker's touch)
+            self.clock_running, self.clock_ref = False, None
         if not out and abs(x) < self.L / 2 - 0.05 and abs(y) < self.W / 2 - 0.05:
             self.out_armed = True                            # seen back on the field: the next out counts
         if out:
@@ -386,6 +409,33 @@ class RealReferee(Node):
                 self._attack_turnover()
                 self._event('공이 밖으로 나감 - 공수 교대, 공을 가운데에 놓아 주세요')
             return
+        at = self.get_parameter('attack_time').value
+        if at > 0 and not self.out_pending and not self.clock_running:
+            # no reliable robot positions here: the first touch = the ball starts moving (6 cm from where it lay
+            # when the new attack began)
+            if self.clock_ref is None:
+                self.clock_ref = (x, y)
+            elif math.hypot(x - self.clock_ref[0], y - self.clock_ref[1]) > 0.06:
+                self.clock_running, self.attack_t0 = True, now
+            return
+        if at > 0 and not self.out_pending and now - self.attack_t0 > at:
+            # the ball stays - unless it lies still next to a goal or on a line: then a person puts it on the
+            # centre spot (the new attack's clock waits for that)
+            ref = self.still_ref
+            still = ref is not None and now - ref[2] > 2.0
+            near_goal = min(math.hypot(x - gx, y) for gx in (-self.L / 2, self.L / 2)) < 0.30
+            on_line = self.W / 2 - abs(y) < 0.06 or (self.L / 2 - abs(x) < 0.06 and abs(y) > self.G / 2 - 0.03)
+            self._attack_turnover()
+            if still and (near_goal or on_line):
+                self.out_pending = True
+                self.pub_fx.publish(String(data='CORNER'))
+                self._event(f'공격 시간 {at:.0f}초 끝 ({"골대 근처" if near_goal else "라인"}에 멈춘 공) - '
+                            f'공수 교대, 공을 가운데에 놓아 주세요')
+            else:
+                self._event(f'공격 시간 {at:.0f}초 끝 - 공은 그대로, 공수 교대')
+            return
+        if not self.get_parameter('swap_on_centre_line').value:
+            return
         side = 1 if x > 0.05 else (-1 if x < -0.05 else 0)
         own = -1 if self.attack == 'YELLOW' else 1          # yellow attacks +x: its own half is -x
         prev = self.half_prev
@@ -393,14 +443,55 @@ class RealReferee(Node):
         if side == own and prev == -own:
             self._attack_turnover()
 
+    def _check_match_time(self, now):
+        mt = self.get_parameter('match_time').value
+        if mt <= 0 or self.phase != 'START' or getattr(self, 'golden', False) or now - self.game_t0 < mt:
+            return
+        if self.yellow != self.blue:
+            win = '노랑' if self.yellow > self.blue else '파랑'
+            self.pub_fx.publish(String(data='FINISHED'))
+            self._set_phase('FINISHED')
+            self._event(f'{int(mt // 60)}분 종료  {self.yellow} : {self.blue}  -  경기 종료, {win} 승리!')
+        else:
+            self.golden = True
+            self._event(f'{int(mt // 60)}분 종료  {self.yellow} : {self.blue} 동점  -  골든골! 다음 골을 넣는 팀이 승리')
+
+    def _publish_game_clock(self, now):
+        """Match time (mm:ss since NEW_GAME) for the match window and the video; stands still once finished."""
+        ph = self.phase
+        if ph in ('WAIT',):
+            text = '00:00'
+        elif ph == 'FINISHED':
+            text = getattr(self, 'clock_text', '00:00')
+        else:
+            t = int(max(0.0, now - self.game_t0))
+            text = f'{t // 60:02d}:{t % 60:02d}'
+        self.clock_text = text
+        self.pub_game_clock.publish(String(data=text))
+
     def tick(self):
         now = time.time()
+        self._publish_game_clock(now)
+        self._check_match_time(now)
         b = self.ball
         seen = b is not None and now - b[2] < 0.6
         if self.phase == 'START' and self._attack_mode():
             if seen:
                 self._attack_tick(b, now)
+            elif self.attack_touched and self.clock_running and not self.out_pending and \
+                    self.get_parameter('attack_time').value > 0 and \
+                    now - self.attack_t0 > self.get_parameter('attack_time').value and \
+                    (b is None or now - b[2] > 3.0):
+                # attack time up and nobody can find the ball: swap, the ball goes on the centre spot
+                self._attack_turnover()
+                self.out_pending = True
+                self.pub_fx.publish(String(data='CORNER'))
+                self._event('공격 시간 끝 (공을 찾을 수 없음) - 공수 교대, 공을 가운데에 놓아 주세요')
             self.pub_attack.publish(String(data=self.attack + ('' if self.attack_touched else '_KICKOFF')))
+            at = self.get_parameter('attack_time').value
+            running = at > 0 and self.attack_touched and not self.out_pending and self.clock_running
+            left = at - (now - self.attack_t0) if running else at
+            self.pub_attack_clock.publish(String(data=f'{self.attack} {left:.1f}' + ('' if running else ' WAIT')))
         else:
             self.pub_attack.publish(String(data='FREE' if not self._attack_mode() else
                                            self.next_attack + '_KICKOFF'))
@@ -441,13 +532,18 @@ class RealReferee(Node):
                     self._event(text)                     # shown in the match window
                 else:
                     self.get_logger().info(text)
+            if ready and centred and ref is not None:
+                need = self.get_parameter('ball_still_time').value
+                self.pub_start_in.publish(String(data='START %.1f' % max(0.0, need - (now - ref[2]))))
+            else:
+                self.pub_start_in.publish(String(data='WAIT 0'))   # waiting for the robots / the ball (see events)
             if ready and centred and still:
                 self.ball_at_mouth_t = None
                 self.corner_since = None
                 self._set_phase('START')
                 self._attack_start()
-                self._event('경기 시작 - 가운데 공 (직전 득점 팀은 3초 뒤 출발)' if self.goals else
-                            '경기 시작 - 가운데 공, 노랑 선공 (파랑은 3초 뒤 출발)')
+                self._event('경기 시작 - 가운데 공 (직전 득점 팀은 2초 뒤 출발)' if self.goals else
+                            '경기 시작 - 가운데 공, 노랑 선공 (파랑은 2초 뒤 출발)')
             elif ready and not centred and still and self.asked_ball != 'off_centre':
                 self.asked_ball = 'off_centre'
                 self._event(f'공이 가운데가 아닙니다 ({b[0]:.2f}, {b[1]:.2f}) - 가운데에 놓으면 자동 시작 '

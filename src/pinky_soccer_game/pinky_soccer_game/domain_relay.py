@@ -19,12 +19,13 @@ from std_msgs.msg import String
 
 # referee / match UI (home domain) -> the other domain
 FORWARD = ['/game/control', '/game/kickoff', '/game/phase', '/game/score', '/game/event', '/game/fx',
-           '/game/goal', '/game/attack']
+           '/game/goal', '/game/attack', '/game/attack_clock', '/game/clock']
 # the other domain -> home domain: (topic there, topic here, type)
 #   sim duel: the blue stack is namespaced (/blue/...); real robots: plain names in their own domain
 BACKWARD = [('/blue/game/state', '/blue/game/state', 'String'),
             ('/game/state', '/blue/game/state', 'String'),
-            ('/ball/position_map', '/blue/ball/position_map', 'PointStamped')]
+            ('/ball/position_map', '/blue/ball/position_map', 'PointStamped'),
+            ('/blue/ball/position_map', '/blue/ball/position_map', 'PointStamped')]     # sim (namespaced)
 
 
 def make_node(domain, name):
@@ -50,6 +51,10 @@ def main():
 
     for t in FORWARD:
         link(home, other, t)
+    # shared ball position (2026-11-26): yellow's camera estimate of the ball for blue, which turns to look there
+    # when it has not seen the ball itself for a moment (sim: namespaced /yellow/...; real: plain name)
+    link(home, other, '/yellow/ball/position_map', kind='PointStamped')
+    link(home, other, '/ball/position_map', '/yellow/ball/position_map', kind='PointStamped')
     # sim referee: blue's AMCL reset after it lifted the blue robot out of a goal (sim_duel: namespaced /blue)
     link(home, other, '/blue/initialpose', kind='PoseWithCovarianceStamped')
     for t_src, t_dst, kind in BACKWARD:

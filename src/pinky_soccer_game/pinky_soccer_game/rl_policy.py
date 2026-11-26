@@ -73,9 +73,12 @@ def robot_guard(v, opp_rel, priority=None, corridor=0.20):
         return v
     # bumpers touch at 0.18 m head-on, 0.21 m corner to corner: 0.155 m let the robots press into each other
     # (user, 2026-11-26: '두 로봇이 너무 가까이 붙는다 - 부딪히지 않게') -> ~3 cm clear even with the right of way
-    stop = 0.24 if priority is None else (0.21 if priority else 0.27)
+    # minimal avoidance, bold play (user, 2026-11-26: '상대 회피는 최소한으로'): stop just short of the bumpers
+    # no collisions, but slow down early and smoothly (user, 2026-11-26): stop before the bumpers meet (0.18 m
+    # head-on, 0.21 m corner to corner), slowing from 0.12 m before that; the one closer to the ball goes first
+    stop = 0.22 if priority is None else (0.20 if priority else 0.26)
     d = math.hypot(ox, oy)
-    return v * max(0.0, min(1.0, (d - stop) / 0.10))
+    return v * max(0.0, min(1.0, (d - stop) / 0.12))
 
 
 def over_line_ahead(pose, v, half_len, half_wid, goal_w):
@@ -422,11 +425,11 @@ def robot_guard_vw(v, w, opp_rel, priority=None):
         return v, w
     ox, oy = float(opp_rel[0]), float(opp_rel[1])
     d = math.hypot(ox, oy)
-    if d < 0.24:                                     # body corners sweep ~0.105 m round the centre
-        w *= max(0.0, min(1.0, (d - 0.17) / 0.07))
+    if d < 0.23:                                     # body corners sweep ~0.105 m round the centre
+        w *= max(0.0, min(1.0, (d - 0.17) / 0.06))
     # personal space 0.17 m; giving way (the other robot has the right of way at the ball): 0.24 m - backing
     # off frees the ball for it (otherwise a ball between the two robots stayed there: r2s2, 2026-11-25)
-    space = 0.27 if priority is False else 0.21
+    space = 0.24 if priority is False else 0.19
     if d < space:
         away = -0.08 if ox > 0.0 else 0.08          # other robot in front -> back up, behind/beside -> forward
         if v * away <= 0.0 or abs(v) < abs(away):
