@@ -63,6 +63,9 @@ class Referee(Node):
         # the goal is announced, and the match window's "공 가운데로" button puts it back (true: the old automatic
         # resets - line / corner / 10 s standstill / out - for unattended test runs)
         self.declare_parameter('auto_ball_reset', False)
+        # attack / defence game (2026-11-25): one robot attacks, the other defends its goal; the roles swap when
+        # the ball crosses the centre line into the attacker's own half; after a goal the conceding team attacks
+        self.declare_parameter('game_mode', 'attack_defense')        # or 'free' (both always attack)
         self.declare_parameter('wall_zone', 0.08)          # m: ball this close to the boundary LINE (or beyond
                                                            # it; the robots must not cross the line) ...
         self.declare_parameter('wall_stuck_time', 3.0)     # ... and not moving this long -> centre (robots
@@ -132,6 +135,10 @@ class Referee(Node):
         self.pub_control = self.create_publisher(String, '/game/control', 10)
         self.pub_phase = self.create_publisher(String, '/game/phase', 10)
         self.pub_goal = self.create_publisher(String, '/game/goal', 10)      # who scored -> celebration
+        # /game/attack: 'YELLOW' / 'BLUE' = that team attacks, the other defends; '<TEAM>_KICKOFF' = that team
+        # goes to the ball, the other waits until it is touched; 'FREE' = both attack (old game)
+        self.pub_attack = self.create_publisher(String, '/game/attack', 10)
+        self.attack, self.attack_touched, self.next_attack = 'YELLOW', False, 'YELLOW'
         self.robot_state = {}                                                # team -> (state, time)
         for team, topic in (('YELLOW', '/yellow/game/state'), ('BLUE', '/blue/game/state'),
                             ('YELLOW', '/game/state')):
@@ -181,6 +188,7 @@ class Referee(Node):
             self.game_t0 = time.time()
             self._publish_score()
             self.kickoff, self.after_goal = 'YELLOW', False
+            self.next_attack = 'YELLOW'                   # first attack: yellow
             self._event('새 경기 시작 - 공은 가운데' if not self.get_parameter('kickoff_rule').value
                         else '새 경기 시작 - 첫 킥오프는 노랑')
             self._prepare()
@@ -225,6 +233,9 @@ class Referee(Node):
                 self.ball_request_t = None
                 self.last_ball = None
                 self.last_move_t = time.time()
+                if not getattr(self, 'out_pending', False):
+                    self._attack_turnover()          # (an out has swapped the roles already)
+                self.out_pending = False
         elif cmd == 'STOP':
             self._set_phase('WAIT')
             self._event('경기 중지')
@@ -274,11 +285,75 @@ class Referee(Node):
         elif now - self.placed_t > self.get_parameter('start_delay').value:
             self._start()
 
+    def _attack_mode(self):
+        return self.get_parameter('game_mode').value == 'attack_defense'
+
+    def _attack_turnover(self, immediate=True):
+        """The ball went out / the referee put it back (button): the defending team won it - the roles swap at
+        once (no kick-off wait: the new defender heads for its goal straight away)."""
+        if self._attack_mode() and self.match_phase == 'START':
+            self.attack = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
+            self.attack_touched = immediate
+            self.half_prev = 0
+            self.swap_t = time.time()
+            other = '노랑' if self.attack == 'BLUE' else '파랑'
+            self._event(f'공수 교대: {"노랑" if self.attack == "YELLOW" else "파랑"} 공격 / {other} 수비')
+
+    def _attack_tick(self, bx, by):
+        """Kick-off touch, then the roles swap whenever the ball crosses the centre line into the attacker's own
+        half (yellow attacks +x, blue -x; 5 cm hysteresis)."""
+        name = {'YELLOW': '노랑', 'BLUE': '파랑'}
+        if not self.attack_touched:
+            p = self.tracker.get('pinky_yellow' if self.attack == 'YELLOW' else 'pinky_blue')
+            touched = math.hypot(bx, by) > 0.06 or (p is not None and math.hypot(p[0] - bx, p[1] - by) < 0.13)
+            if touched:
+                self.attack_touched = True
+                other = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
+                self._event(f'{name[self.attack]} 공격 / {name[other]} 수비')
+            return
+        if abs(bx) > self.L / 2 + 0.01 or abs(by) > self.W / 2 + 0.01:
+            return                       # ball out: the out rule has swapped the roles already (r: ad2 double swap)
+        # the defender wins the ball: the ball at its nose, moving away from its goal, for 0.7 s -> it attacks
+        # now and the attacker has to run back at once (user: 'yellow should hurry back to its goal')
+        dteam = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
+        dp = self.tracker.get('pinky_blue' if dteam == 'BLUE' else 'pinky_yellow')
+        away = 1.0 if dteam == 'YELLOW' else -1.0       # yellow's goal is at -x: away = +x
+        prev = getattr(self, 'poss_ball', None)
+        self.poss_ball = (bx, by)
+        moving_away = prev is not None and (bx - prev[0]) * away > 0.002
+        settled = time.time() - getattr(self, 'swap_t', 0.0) > 3.0      # no ping-pong: 3 s after any swap
+        if dp is not None and math.hypot(dp[0] - bx, dp[1] - by) < 0.14 and moving_away and settled:
+            self.poss_t = getattr(self, 'poss_t', None) or time.time()
+            if time.time() - self.poss_t > 1.0:
+                self.poss_t = None
+                self.attack = dteam
+                self.half_prev = 0
+                self.swap_t = time.time()
+                other = 'BLUE' if dteam == 'YELLOW' else 'YELLOW'
+                self._event(f'공수 교대 (공 뺏음): {name[dteam]} 공격 / {name[other]} 수비')
+                return
+        elif dp is None or math.hypot(dp[0] - bx, dp[1] - by) > 0.20:
+            self.poss_t = None
+        # only a CROSSING of the centre line (from the attacking half into the attacker's own half) swaps - a
+        # ball already lying in the new attacker's half after a ball win must not swap straight back (ad6)
+        side = 1 if bx > 0.05 else (-1 if bx < -0.05 else 0)
+        own = -1 if self.attack == 'YELLOW' else 1          # the attacker's own half
+        prev = getattr(self, 'half_prev', 0)
+        self.half_prev = side if side != 0 else prev
+        back = side == own and prev == -own
+        if back:
+            self.swap_t = time.time()
+            self.attack = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
+            other = 'BLUE' if self.attack == 'YELLOW' else 'YELLOW'
+            self._event(f'공수 교대: {name[self.attack]} 공격 / {name[other]} 수비')
+
     def _start(self):
         if self.kickoff_spot is None:
             ball = self.tracker.get('golf_ball')
             self.kickoff_spot = (ball[0], ball[1]) if ball else None
         self.kickoff_t0 = time.time()
+        self.attack, self.attack_touched = self.next_attack, False
+        self.half_prev = 0
         self.last_ball = None
         self.last_move_t = time.time()
         self.cooldown_until = time.time() + 0.5
@@ -318,6 +393,7 @@ class Referee(Node):
         self.kickoff = ('BLUE' if team == 'YELLOW' else 'YELLOW') if self.get_parameter('kickoff_rule').value \
             else 'OPEN'
         self.after_goal = True
+        self.next_attack = 'BLUE' if team == 'YELLOW' else 'YELLOW'     # the conceding team attacks next
         name = '노랑' if team == 'YELLOW' else '파랑'
         line = f'{self.goals[-1][0]}  {name} {kind}!  {self.yellow} : {self.blue}'
         # celebration: the scorer drives to the middle of its own half and spins; GOAL lasts until it is done
@@ -377,30 +453,56 @@ class Referee(Node):
             if now - ref[0] < self.get_parameter('jam_timeout').value:
                 continue
             self.jam_since.pop(name, None)
-            start = self.L / 2 - self.get_parameter('ready_offset').value
-            x, y, yaw = (-start, 0.0, 0.0) if name == 'pinky_yellow' else (start, 0.0, math.pi)
-            # MuJoCo: drop it from the spawn height (3 cm) - at 1 cm the wheels sink into the floor and the
-            # robot stays tilted (lidar on the floor -> AMCL lost, barely drives)
-            z = 0.03 if self.get_parameter('sim_backend').value == 'mujoco' else 0.01
-            self._set_model_pose(name, x, y, z, yaw)
-            # AMCL would keep the old pose: tell it where it is
-            pub = self.pub_initialpose if name == 'pinky_yellow' else self.pub_initialpose_blue
-            m = PoseWithCovarianceStamped()
-            m.header.frame_id = 'map'
-            m.header.stamp = self.get_clock().now().to_msg()
-            m.pose.pose.position.x, m.pose.pose.position.y = x, y
-            m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
-            m.pose.covariance[0] = m.pose.covariance[7] = 0.0025
-            m.pose.covariance[35] = 0.01
-            def send(msg=m, p=pub):
-                # stamp NOW: AMCL moves an initial pose by the odometry since its stamp - with the rescue-time
-                # stamp that included the teleport, so AMCL started 2 rad off and flipped to the mirrored
-                # field (r8s2: 1.4 m error for the rest of the set)
-                msg.header.stamp = self.get_clock().now().to_msg()
-                p.publish(msg)
-            for delay in (0.8, 1.6):                   # after the simulator has moved it (twice: sure)
-                threading.Timer(delay, send).start()
-            self._event(f'{"노랑" if name == "pinky_yellow" else "파랑"} 로봇이 골대에 끼어 출발 위치로 옮김')
+            self._lift_robot(name, f'{"노랑" if name == "pinky_yellow" else "파랑"} 로봇이 골대에 끼어 출발 위치로 옮김')
+
+    def _check_robot_lock(self, now):
+        """Two robots hooked into each other (g23, 2026-11-26: 8 min without moving a millimetre while both
+        tried to drive out): like a person on the field, separate them - the defender (blue in a free game)
+        is put back on its start pose in front of its own goal, where it was heading anyway."""
+        y, b = self.tracker.get('pinky_yellow'), self.tracker.get('pinky_blue')
+        if y is None or b is None or math.hypot(y[0] - b[0], y[1] - b[1]) > 0.18:
+            self.lock_ref = None
+            return
+        ref = getattr(self, 'lock_ref', None)
+        moved = ref is not None and any(
+            math.hypot(p[0] - r[0], p[1] - r[1]) > 0.03 or abs(_wrap(p[3] - r[3])) > 0.3
+            for p, r in ((y, ref[1]), (b, ref[2])))
+        if ref is None or moved:
+            self.lock_ref = (now, y, b)
+            return
+        if now - ref[0] < 8.0:
+            return
+        self.lock_ref = None
+        defender = 'pinky_blue'
+        if self._attack_mode() and getattr(self, 'attack', 'YELLOW') == 'BLUE':
+            defender = 'pinky_yellow'
+        self._lift_robot(defender, f'두 로봇이 엉켜 못 움직임 - {"노랑" if defender == "pinky_yellow" else "파랑"}(수비)을 골대 앞으로 옮김')
+
+    def _lift_robot(self, name, text):
+        start = self.L / 2 - self.get_parameter('ready_offset').value
+        x, y, yaw = (-start, 0.0, 0.0) if name == 'pinky_yellow' else (start, 0.0, math.pi)
+        # MuJoCo: drop it from the spawn height (3 cm) - at 1 cm the wheels sink into the floor and the
+        # robot stays tilted (lidar on the floor -> AMCL lost, barely drives)
+        z = 0.03 if self.get_parameter('sim_backend').value == 'mujoco' else 0.01
+        self._set_model_pose(name, x, y, z, yaw)
+        # AMCL would keep the old pose: tell it where it is
+        pub = self.pub_initialpose if name == 'pinky_yellow' else self.pub_initialpose_blue
+        m = PoseWithCovarianceStamped()
+        m.header.frame_id = 'map'
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.pose.pose.position.x, m.pose.pose.position.y = x, y
+        m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+        m.pose.covariance[0] = m.pose.covariance[7] = 0.0025
+        m.pose.covariance[35] = 0.01
+        def send(msg=m, p=pub):
+            # stamp NOW: AMCL moves an initial pose by the odometry since its stamp - with the rescue-time
+            # stamp that included the teleport, so AMCL started 2 rad off and flipped to the mirrored
+            # field (r8s2: 1.4 m error for the rest of the set)
+            msg.header.stamp = self.get_clock().now().to_msg()
+            p.publish(msg)
+        for delay in (0.8, 1.6):                   # after the simulator has moved it (twice: sure)
+            threading.Timer(delay, send).start()
+        self._event(text)
 
     def _set_model_pose(self, name, x, y, z, yaw):
         """Move a model: Gazebo set_pose service, or MuJoCo /sim/set_pose (mujoco_soccer)."""
@@ -466,13 +568,20 @@ class Referee(Node):
         if req is not None:                            # button pressed while a robot stood on the centre spot
             if self._centre_ball('공 가운데로 (버튼) - 로봇·점수 그대로, 경기 계속'):
                 self.ball_request_t, self.last_ball, self.last_move_t = None, None, now
+                if not getattr(self, 'out_pending', False):
+                    self._attack_turnover()          # (an out has swapped the roles already)
+                self.out_pending = False
             elif now - req > 3.0:
                 self.ball_request_t = None
                 self._event('공 가운데로: 센터에 로봇이 있어서 옮기지 못함 - 다시 눌러 주세요')
         if self.match_control:
             self.pub_kickoff.publish(String(data=self.kickoff))
+            self.pub_attack.publish(String(data='FREE' if not self._attack_mode() else
+                                           self.attack + ('' if self.attack_touched else '_KICKOFF')))
             if self.match_phase in ('PREPARE', 'START', 'GOAL'):   # GOAL: the scorer may be stuck in there
                 self._check_goal_jam(now)
+            if self.match_phase == 'START':
+                self._check_robot_lock(now)
             if self.match_phase == 'PREPARE':
                 self._tick_prepare(now)
             elif self.match_phase == 'GOAL' and self._celebration_over(now):
@@ -488,6 +597,8 @@ class Referee(Node):
         if ball is None:
             return
         bx, by = ball[0], ball[1]
+        if self._attack_mode() and self.match_phase == 'START':
+            self._attack_tick(bx, by)
 
         if self.kickoff in ('YELLOW', 'BLUE') and self.match_phase == 'START':
             moved = self.kickoff_spot is None or \
@@ -526,11 +637,26 @@ class Referee(Node):
             self._event(f'GOAL! BLUE scores ->  YELLOW {self.yellow} - {self.blue} BLUE')
         else:
             # behind a goal line but beside the goal: bring it back to the centre and play on
-            if not self.get_parameter('auto_ball_reset').value:
+            if not self.get_parameter('auto_ball_reset').value or self._attack_mode():
+                auto = self.get_parameter('auto_ball_reset').value
                 out = (abs(bx) > self.L / 2 + 0.01 and not in_mouth) or abs(by) > self.W / 2 + 0.01
-                if out and not getattr(self, 'out_called', False):
+                pending = getattr(self, 'out_pending', False)
+                if not out and abs(bx) < self.L / 2 - 0.05 and abs(by) < self.W / 2 - 0.05:
+                    self.out_armed = True        # seen back in the field: the next out counts
+                if out and not pending and getattr(self, 'out_armed', True):
                     where = '골라인' if abs(bx) > self.L / 2 + 0.01 else '사이드라인'
-                    self._event(f'공이 {where} 밖으로 나감 - 로봇은 대기, 심판이 "공 가운데로" 버튼으로 옮겨 주세요')
+                    self.out_t, self.out_pending, pending = now, True, True
+                    self.out_armed = False       # (the ball position lags the re-spot: no second out from it)
+                    # out: the roles swap at once (the attacker turns back to defend right away), the ball goes
+                    # back to the centre by itself after 1 s (user, 2026-11-25) - unclear cases stay the button's.
+                    # One out = one swap: a ball bouncing on the line counted twice and swapped back (ad3)
+                    self._attack_turnover(immediate=True)
+                    self._event(f'공이 {where} 밖으로 나감 - 1초 뒤 가운데로')
+                if pending and now - self.out_t > 1.0:
+                    if self._centre_ball('나간 공 -> 가운데, 경기 계속'):
+                        self.last_ball, self.last_move_t = None, now
+                        self.out_pending = False
+                        out = False
                 self.out_called = out
                 # ball lying on a line where no robot can reach it without crossing the line: only an
                 # announcement - the person refereeing decides (button), the ball is not moved
@@ -540,6 +666,14 @@ class Referee(Node):
                         (self.L / 2 - abs(bx) < 0.06 and abs(by) > self.G / 2 - 0.03 or self.W / 2 - abs(by) < 0.06):
                     self.line_called = True
                     self._event('공이 라인에 붙어 로봇이 꺼낼 수 없음 - 심판 판단: "공 가운데로" 버튼')
+                # unattended test runs (auto_ball_reset): what the person would do - the stuck ball (5 s on a line,
+                # 15 s anywhere) back to the centre, the roles swap like after the button
+                if auto and not out and self.last_move_t is not None and (
+                        (getattr(self, 'line_called', False) and now - self.last_move_t > 5.0) or
+                        now - self.last_move_t > 15.0):
+                    if self._centre_ball('(자동 테스트) 멈춘 공 -> 가운데, 공수 교대'):
+                        self.last_ball, self.last_move_t, self.line_called = None, now, False
+                        self._attack_turnover()
                 return
             if abs(bx) > self.L / 2 + 0.01 and not in_mouth:
                 self.out_since = self.out_since or now

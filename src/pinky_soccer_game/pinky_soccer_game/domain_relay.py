@@ -19,7 +19,7 @@ from std_msgs.msg import String
 
 # referee / match UI (home domain) -> the other domain
 FORWARD = ['/game/control', '/game/kickoff', '/game/phase', '/game/score', '/game/event', '/game/fx',
-           '/game/goal']
+           '/game/goal', '/game/attack']
 # the other domain -> home domain: (topic there, topic here, type)
 #   sim duel: the blue stack is namespaced (/blue/...); real robots: plain names in their own domain
 BACKWARD = [('/blue/game/state', '/blue/game/state', 'String'),

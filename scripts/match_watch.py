@@ -70,6 +70,15 @@ def on_truth(m):
         close['min'] = min(close['min'], d)
         if close['t'] is not None and d < 0.16:
             close['time'] += min(0.2, now - close['t'])
+            if close.get('c0') is None:
+                close['c0'], close['cmin'] = now, d
+                log(f"  CONTACT start {phase[0]} d {d * 100:.1f} cm yellow ({y[0]:+.2f},{y[1]:+.2f}) "
+                    f"{state.get('yellow', '?')} | blue ({b[0]:+.2f},{b[1]:+.2f}) {state.get('blue', '?')}")
+            close['cmin'] = min(close['cmin'], d)
+        elif close.get('c0') is not None and d > 0.17:
+            log(f"  CONTACT end after {now - close['c0']:.1f} s, min {close['cmin'] * 100:.1f} cm "
+                f"(yellow {state.get('yellow', '?')} | blue {state.get('blue', '?')})")
+            close['c0'] = None
         close['t'] = now
 
 

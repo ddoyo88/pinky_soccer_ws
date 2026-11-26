@@ -15,7 +15,7 @@ for ln in watch:
     t, rest = float(m.group(1)), m.group(2)
     if rest.startswith('EVENT'):
         e = rest[6:]
-        if '골!' in e:
+        if '골!' in e and '경기 종료,' not in e:
             goals.append((t, e.split('  ')[1] if '  ' in e else e))
         elif '초 동안 안 움직임' in e:
             events['ball still (deadlock) -> centre'] += 1
@@ -29,6 +29,14 @@ for ln in watch:
             events['robot stuck in a goal -> lifted'] += 1
         elif '초과' in e:
             events['start-pose timeout'] += 1
+        elif '밖으로 나감' in e:
+            events['ball out -> centre + swap'] += 1
+        elif '(자동 테스트)' in e:
+            events['(test) stuck ball -> centre + swap'] += 1
+        elif '공 뺏음' in e:
+            events['swap: defender won the ball'] += 1
+        elif e.startswith('공수 교대:'):
+            events['swap: centre line / out'] += 1
         elif '경기 시작 - 가운데 공, 노랑' in e and start_t is None:
             start_t = t
     elif 'PHASE' in rest and 'FINISHED' in rest:

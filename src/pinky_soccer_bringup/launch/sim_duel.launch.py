@@ -226,7 +226,7 @@ def generate_launch_description():
         DeclareLaunchArgument('avoid_opponent', default_value='true',
                               description='true: the other robot is an obstacle (slow down / go round it); '
                                           'false: contact allowed'),
-        DeclareLaunchArgument('ball_roll', default_value='0.00022', description='MuJoCo ball rolling friction [m]'),
+        DeclareLaunchArgument('ball_roll', default_value='0.00035', description='MuJoCo ball rolling friction [m]'),
         DeclareLaunchArgument('headless', default_value='false'),
         DeclareLaunchArgument('sensor_view', default_value='true',
                               description='window: each robot camera + detection, lidar, sensor values'),

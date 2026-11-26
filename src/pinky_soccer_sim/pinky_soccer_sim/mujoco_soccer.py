@@ -64,7 +64,7 @@ def quat_yaw(q):
 
 
 # ------------------------------------------------------------------------------------------------ model
-def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.00022, markings=True, hull_verts=0, visuals=True):
+def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.00035, markings=True, hull_verts=0, visuals=True):
     """Field + ball + yellow/blue Pinky -> compiled MjModel.  markings=False leaves out the painted lines (visual
     only).  hull_verts > 0 caps the collision hulls of the robot meshes (up to 11k vertices: the physics of
     several processes then fights over the CPU cache and does not scale - RL training uses 64).  visuals=False
@@ -521,7 +521,7 @@ def main(args=None):
     ap.add_argument('--blue-pose', default='auto', help='x,y,yaw (auto = +L/4, 0, pi)')
     ap.add_argument('--cam-tilt', type=float, default=20.0)
     ap.add_argument('--max-linear', type=float, default=0.30)
-    ap.add_argument('--ball-roll', type=float, default=0.00022, help='rolling friction [m]; larger = stops sooner')
+    ap.add_argument('--ball-roll', type=float, default=0.00035, help='rolling friction [m]; larger = stops sooner')
     ap.add_argument('--output-dir', default='/tmp/pinky_soccer/mujoco')
     opt, _ = ap.parse_known_args(args)
 

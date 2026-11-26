@@ -47,7 +47,10 @@ class GuardedPublisher:
         self.pub, self.guard = pub, guard
 
     def publish(self, cmd):
-        self.pub.publish(self.guard(cmd))
+        self.last_in = (cmd.linear.x, cmd.angular.z)
+        out = self.guard(cmd)
+        self.last_out = (out.linear.x, out.angular.z)
+        self.pub.publish(out)
 
 
 def clip(v, lo, hi):
@@ -146,6 +149,7 @@ class Striker(Node):
         self.ball = None
         self.ball_t = 0.0
         self.rl_pp = {}                    # RL command post-processing state (rl_post_process)
+        self.attack_msg, self.attack_t = None, 0.0     # /game/attack from the referee (attack/defence game)
         self.kick_circle = False
         self.opp = None
         self.opp_t = 0.0
@@ -195,6 +199,7 @@ class Striker(Node):
             self.create_subscription(String, '/game/kickoff', self._kickoff, 10)
             self.create_subscription(String, '/game/goal', self._goal_scored, 10)
             self.create_subscription(String, '/game/event', self._game_event, 10)
+            self.create_subscription(String, '/game/attack', self._attack_msg, 10)
 
         self.cmd_pub = GuardedPublisher(self.create_publisher(Twist, self.get_parameter('cmd_topic').value, 10),
                                         lambda c: self._line_guard(self._robot_guard(self._kick_circle_guard(c))))   # line last: moving
@@ -226,6 +231,22 @@ class Striker(Node):
             return                                        # a frame from before the referee moved the ball
         self.ball = np.array([m.point.x, m.point.y])
         self.ball_t = time.time()
+        self.carrying = False
+        if time.time() >= getattr(self, 'ball_reset_until', 0.0):
+            self.ball_placed_until = 0.0                  # a real sighting replaces the placed position
+
+    def _attack_msg(self, m):
+        self.attack_msg, self.attack_t = m.data.strip().upper(), time.time()
+
+    def _role(self):
+        """attack / defend / kickoff (go to the ball) / wait (the other team kicks off) / None (free game)."""
+        a = self.attack_msg
+        if a is None or a == 'FREE' or time.time() - self.attack_t > 2.0:
+            return None
+        team = self.get_parameter('team').value.upper()
+        if a.endswith('_KICKOFF'):
+            return 'kickoff' if a.startswith(team) else 'wait'
+        return 'attack' if a == team else 'defend'
 
     def _game_event(self, m):
         """The referee put the ball back on the centre spot: forget the old spot (corner, beside the goal) and
@@ -235,9 +256,12 @@ class Striker(Node):
             # a new match (also one restarted mid-game): first kick-off rules again (yellow first, blue +3 s)
             self.first_kickoff, self.scored_last, self.concede_xy = True, False, None
         if ('중앙' in t or '가운데' in t) and '못함' not in t:
+            # the referee placed it there: a known position, drive to it straight away even if the camera does
+            # not pick it up yet (attackers stood searching 15 s for a ball 0.7 m away on the centre spot, g01)
             self.ball = np.array([0.0, 0.0])
-            self.ball_t = time.time() - self.get_parameter('rl_search_after').value - 0.05
+            self.ball_t = time.time()
             self.ball_reset_until = time.time() + 1.0
+            self.ball_placed_until = time.time() + 8.0
 
     def _scan(self, m):
         self.scan = m
@@ -329,10 +353,80 @@ class Striker(Node):
             self.set_state('CELEBRATE_DONE')
         self.cmd_pub.publish(cmd)
 
+    def _unjam(self, pose, now):
+        """Two robots pressed together, one against a line / in a corner: the robot guard blocks forward, the line
+        guard backward - both stood still for 80 s (g06, 2026-11-26).  Not moved for 2 s with the other robot
+        within 0.24 m -> turn away from it (bent toward the field centre if the line is that way) and drive
+        out straight for 1.2 s."""
+        x, y, yaw = pose
+        uj = getattr(self, 'unjam', None)
+        if uj is not None and now < uj[0]:
+            err = wrap(uj[1] - yaw)
+            cmd = Twist()
+            cmd.angular.z = clip(2.5 * err, -2.0, 2.0)
+            cmd.linear.x = 0.12 if abs(err) < 0.4 else 0.0
+            self.cancel_nav()
+            self.cmd_pub.publish(cmd)
+            self.set_state('UNJAM')
+            return True
+        opp = self.estimate_opponent(pose)
+        ref = getattr(self, 'unjam_ref', None)
+        if ref is None or math.hypot(x - ref[0], y - ref[1]) > 0.03 or self.rl_pp.get('mode') in ('WAIT', 'KEEP'):
+            self.unjam_ref = (x, y, now)
+            return False
+        if opp is None or math.hypot(opp[0] - x, opp[1] - y) > 0.20 or now - ref[2] < 2.0:
+            return False
+        from pinky_soccer_game.rl_policy import over_line_ahead
+        away = math.atan2(y - opp[1], x - opp[0])
+        centre = math.atan2(-y, -x)
+        head = away
+        for k in range(7):                                   # turn the escape direction toward the centre
+            a = away + wrap(centre - away) * k / 6.0
+            if not over_line_ahead((x, y, a), 0.12, self.L / 2, self.W / 2, self.G) and \
+                    goal_mouth_guard((x, y, a), 0.12, self.L / 2, self.G) > 0.0:
+                head = a
+                break
+        self.unjam = (now + 2.0, head)                       # ~0.8 s turning + ~1.2 s driving
+        self.unjam_ref = None
+        self.get_logger().info('pressed against the other robot: driving out')
+        return False
+
+    def _carry_ball(self, pose, now):
+        """Camera blind spot: a ball right at the nose drops out of the image.  The remembered spot then stayed
+        where the push began, the robot thought the ball was beside / behind it and went round or backed off
+        to search (most of the 15 s standstills, g11, 2026-11-26).  Last seen just ahead and we kept driving
+        forward -> the ball moves with the nose (for up to 2.5 s; a real sighting replaces it at once)."""
+        x, y, yaw = pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        if self.ball is None:
+            return
+        fresh = now - self.ball_t < 0.25 and not getattr(self, 'carrying', False)
+        if fresh:
+            dx, dy = self.ball[0] - x, self.ball[1] - y
+            self.ball_rel = (c * dx + s * dy, -s * dx + c * dy, now)
+            return
+        rel = getattr(self, 'ball_rel', None)
+        if rel is None or now - rel[2] > 2.5 or not (0.0 < rel[0] < 0.22 and abs(rel[1]) < 0.08):
+            self.carrying = False
+            return
+        v = getattr(self, 'rl_cmd', (0.0, 0.0))[0]
+        if not getattr(self, 'carrying', False) and v <= 0.02:
+            return                                       # not pushing: leave the memory as it is
+        fx = min(rel[0], 0.075)                          # pushed: the ball sits against the bumper
+        self.carrying = True
+        self.ball = np.array([x + c * fx - s * rel[1], y + s * fx + c * rel[1]])
+        self.ball_t = now - 0.3                          # remembered, not seen (keeps 'fresh' tests honest)
+
     def _rl_play(self, pose, now):
         """PLAY with the learned policy: a new action every 0.1 s (the training rate), repeated in between."""
+        if self._unjam(pose, now):
+            return
+        self._carry_ball(pose, now)
         unseen = (now - self.ball_t) if self.ball is not None else 1e9
-        if unseen > self.get_parameter('rl_search_after').value:
+        if now < getattr(self, 'ball_placed_until', 0.0):
+            unseen = 0.0                                  # ball just placed on the centre spot by the referee
+        if unseen > self.get_parameter('rl_search_after').value and self._role() not in ('defend', 'wait'):
+            # (a defender that lost the ball keeps its goal - no search walk; see the role code below)
             # safety net for the game flow: the policy does not find the ball -> first turn to where it was last
             # seen (quick), then the proven search routine (back up, spin, roam)
             self.cancel_nav()
@@ -377,6 +471,35 @@ class Striker(Node):
         # ball out of the field (over a line, waiting for the referee's 'ball to centre'): no chasing it into a
         # goal or over the line - stand still facing it (blue kept walking into its own goal for it, final5f)
         b = self.ball
+        if b is not None and (abs(b[0]) > self.L / 2 + 0.01 or abs(b[1]) > self.W / 2 + 0.01) and \
+                self._role() in ('defend', 'attack'):
+            # attack / defence game, ball out: the roles have just swapped - the new defender runs back to its
+            # goal at once, the new attacker lines up behind the centre spot for the ball coming back there
+            from pinky_soccer_game.rl_policy import defend_cmd
+            vmax = self.get_parameter('v_dribble').value
+            if self._role() == 'defend':
+                v, w, mode = defend_cmd(pose, None, -self.goal[0], self.W / 2, self.G, vmax, self.rl_pp)
+                tag = 'DEFEND_' + mode
+            else:
+                gx = self.goal[0]
+                tx, ty = -math.copysign(0.25, gx), 0.0              # 0.25 m behind the centre spot
+                d = math.hypot(tx - pose[0], ty - pose[1])
+                if d > 0.05:
+                    err = wrap(math.atan2(ty - pose[1], tx - pose[0]) - pose[2])
+                    v = 0.0 if abs(err) > 0.5 else vmax * max(0.3, math.cos(err))
+                    w = clip(2.5 * err, -2.0, 2.0)
+                else:
+                    err = wrap(math.atan2(0.0 - pose[1], 0.0 - pose[0]) - pose[2])
+                    v, w = 0.0, (clip(2.5 * err, -2.0, 2.0) if abs(err) > 0.1 else 0.0)
+                tag = 'ATTACK_READY'
+            cmd = Twist()
+            cmd.linear.x = goal_mouth_guard(pose, v, self.L / 2, self.G, nose=0.09 + 0.25 * abs(v))
+            cmd.angular.z = w
+            self.cancel_nav()
+            self.cmd_pub.publish(cmd)
+            self.rl_pp['mode'] = 'WAIT'
+            self.set_state(tag)
+            return
         if b is not None and (abs(b[0]) > self.L / 2 + 0.01 or abs(b[1]) > self.W / 2 + 0.01):
             err = wrap(math.atan2(b[1] - pose[1], b[0] - pose[0]) - pose[2])
             cmd = Twist()
@@ -386,6 +509,44 @@ class Striker(Node):
             self.rl_pp['mode'] = 'WAIT'
             self.set_state('BALL_OUT_WAIT')
             return
+        role = self._role()
+        if role == 'wait':
+            # the other team kicks off: stay where we are (outside the centre circle), face the ball
+            err = wrap(math.atan2(b[1] - pose[1], b[0] - pose[0]) - pose[2]) if b is not None else 0.0
+            cmd = Twist()
+            cmd.angular.z = clip(2.0 * err, -1.5, 1.5) if abs(err) > 0.2 else 0.0
+            self.cancel_nav()
+            self.cmd_pub.publish(cmd)
+            self.rl_pp['mode'] = 'WAIT'
+            self.set_state('KICKOFF_WAIT')
+            return
+        if role == 'defend':
+            from pinky_soccer_game.rl_policy import defend_cmd
+            own_x = -self.goal[0]
+            from pinky_soccer_game.rl_policy import ball_filter
+            bf = ball_filter(self.rl_pp, b) if b is not None else None
+            v, w, mode = defend_cmd(pose, bf, own_x, self.W / 2, self.G,
+                                    self.get_parameter('v_dribble').value, self.rl_pp)
+            age = now - self.ball_t
+            near_goal = abs(pose[0] - own_x) < 0.35
+            if mode.startswith('GO_KEEP') and b is not None and 1.0 < age < 6.0 and near_goal:
+                # (only near the goal: stopping to look on the way back blocked the attacker mid-field, h01)
+                # on the way to the goal and the ball out of view for 1 s: a quick look at it (user,
+                # 2026-11-26: both robots should have the ball in the camera about once a second)
+                err = wrap(math.atan2(b[1] - pose[1], b[0] - pose[0]) - pose[2])
+                if abs(err) > 0.3:
+                    v, w, mode = 0.0, clip(2.5 * err, -1.2, 1.2), 'LOOK'
+            self.rl_pp['mode'] = 'WAIT' if mode in ('KEEP', 'LOOK') else mode
+            if mode.startswith('CLEAR_PUSH') or mode.startswith('CLEAR_SHOT'):
+                self.push_t = time.time()
+            self.rl_cmd = (v, w)
+            cmd = Twist()
+            cmd.linear.x = goal_mouth_guard(pose, v, self.L / 2, self.G, nose=0.09 + 0.25 * abs(v))
+            cmd.angular.z = w
+            self.cancel_nav()
+            self.cmd_pub.publish(cmd)
+            self.set_state('DEFEND_' + mode)
+            return
         # approach and dribble in straight lines (the learned policy weaved: 1.8 turn reversals/s; straight
         # control in the same test: 0.3/s and twice the goals) - every tick, 20 Hz
         from pinky_soccer_game.rl_policy import straight_cmd
@@ -394,7 +555,10 @@ class Striker(Node):
             # ball on the end line beside the goal: a push at the goal centre runs into the line (line guard
             # stops it every time, final5i) - first along the line into the mouth, then the normal shot
             aim = np.array([self.goal[0] - math.copysign(0.12, self.goal[0]), 0.0])
-        v, w, mode = straight_cmd(pose, self.ball, aim, self.W / 2, half_len=self.L / 2, v_max=
+        from pinky_soccer_game.rl_policy import ball_filter
+        bf = ball_filter(self.rl_pp, self.ball) if self.ball is not None else None
+        self.rl_pp['ball_age'] = now - self.ball_t           # the orbit looks at the ball when it is > 1 s
+        v, w, mode = straight_cmd(pose, bf, aim, self.W / 2, half_len=self.L / 2, v_max=
                                   self.get_parameter('v_dribble').value, state=self.rl_pp,
                                   give_way=self._give_way(pose), free=self._ball_free(pose))
         self.rl_pp['mode'] = mode
@@ -425,6 +589,29 @@ class Striker(Node):
         else:
             self.guard_since = None
         self.set_state('PLAY_' + self.rl_pp.get('mode', 'BEHIND'))
+        # diagnostics: going to the ball but hardly moving (g14: 11 s ROUND, 15 cm) -> say what holds it back
+        ref = getattr(self, 'slow_ref', None)
+        py = getattr(self, 'slow_yaw', None)
+        self.slow_turn = getattr(self, 'slow_turn', 0.0) + (abs(wrap(pose[2] - py)) if py is not None else 0.0)
+        self.slow_yaw = pose[2]
+        m = self.rl_pp.get('mode')
+        if m != getattr(self, 'slow_mode', None):
+            self.slow_flips = getattr(self, 'slow_flips', 0) + 1
+            self.slow_mode = m
+        if ref is None or now - ref[2] > 3.0:
+            if ref is not None and math.hypot(pose[0] - ref[0], pose[1] - ref[1]) < 0.06 and \
+                    self.rl_pp.get('mode') in ('BEHIND', 'ROUND', 'PUSH', 'APPROACH', 'ORBIT_STEP', 'ORBIT_LOOK'):
+                cin = getattr(self.cmd_pub, 'last_in', None)
+                cout = getattr(self.cmd_pub, 'last_out', None)
+                opp = self.opp if (self.opp is not None and now - self.opp_t < 2.0) else None
+                self.get_logger().info(
+                    f'slow {self.rl_pp.get("mode")}: pose ({pose[0]:+.2f},{pose[1]:+.2f},{pose[2]:+.2f}) '
+                    f'ball {None if self.ball is None else tuple(round(float(q), 2) for q in self.ball)} '
+                    f'seen {now - self.ball_t:.1f}s ago, opp {None if opp is None else tuple(round(float(q), 2) for q in opp[:2])}, '
+                    f'cmd {self.rl_cmd[0]:+.2f},{self.rl_cmd[1]:+.2f} -> mouth {cin} -> guards {cout}; '
+                    f'turned {self.slow_turn:.1f} rad, {self.slow_flips} mode changes in 3 s')
+            self.slow_ref = (pose[0], pose[1], now)
+            self.slow_turn, self.slow_flips = 0.0, 0
 
     def _line(self, m):
         self.line_pts = np.array([[q.position.x, q.position.y] for q in m.poses]).reshape(-1, 2)
@@ -905,6 +1092,9 @@ class Striker(Node):
                 self.rl_idle_ref = (rx, ry, ryaw, now_t)
             elif self.rl_pp.get('mode') in ('WAIT', 'GIVE_WAY', 'AIM'):
                 self.rl_idle_ref = (rx, ry, ryaw, now_t)    # waiting / giving way on purpose: not idle
+            elif self._role() is not None:
+                pass        # attack / defence game: the unjam step in _rl_play frees it, the old rule-based
+                            # states (ORBIT / BACKOFF) only backed into the line and froze for minutes (g06)
             elif now_t - ref[3] > self.get_parameter('rl_idle_after').value and now_t >= getattr(self, 'rl_rules_until', 0):
                 self.rl_rules_until = now_t + self.get_parameter('rl_rules_for').value
                 self.rl_idle_ref = None
