@@ -130,7 +130,7 @@ def generate_launch_description():
         DeclareLaunchArgument('policy_blue', default_value='',
                               description='RL policy .npz for blue; empty = rules'),
         DeclareLaunchArgument('avoid_opponent', default_value='true'),
-        DeclareLaunchArgument('win_score', default_value='5'),
+        DeclareLaunchArgument('win_score', default_value='0'),   # 0: no 'first to N' - the timed match decides
         DeclareLaunchArgument('sensor_view', default_value='true'),
         OpaqueFunction(function=launch_setup),
     ])

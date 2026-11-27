@@ -25,7 +25,9 @@ FORWARD = ['/game/control', '/game/kickoff', '/game/phase', '/game/score', '/gam
 BACKWARD = [('/blue/game/state', '/blue/game/state', 'String'),
             ('/game/state', '/blue/game/state', 'String'),
             ('/ball/position_map', '/blue/ball/position_map', 'PointStamped'),
-            ('/blue/ball/position_map', '/blue/ball/position_map', 'PointStamped')]     # sim (namespaced)
+            ('/blue/ball/position_map', '/blue/ball/position_map', 'PointStamped'),     # sim (namespaced)
+            ('/blue/ball/cam_dist', '/blue/ball/cam_dist', 'String'),      # camera ball distances (who goes first)
+            ('/ball/cam_dist', '/blue/ball/cam_dist', 'String')]
 
 
 def make_node(domain, name):
@@ -55,6 +57,8 @@ def main():
     # when it has not seen the ball itself for a moment (sim: namespaced /yellow/...; real: plain name)
     link(home, other, '/yellow/ball/position_map', kind='PointStamped')
     link(home, other, '/ball/position_map', '/yellow/ball/position_map', kind='PointStamped')
+    link(home, other, '/yellow/ball/cam_dist', kind='String')
+    link(home, other, '/ball/cam_dist', '/yellow/ball/cam_dist', kind='String')
     # sim referee: blue's AMCL reset after it lifted the blue robot out of a goal (sim_duel: namespaced /blue)
     link(home, other, '/blue/initialpose', kind='PoseWithCovarianceStamped')
     for t_src, t_dst, kind in BACKWARD:

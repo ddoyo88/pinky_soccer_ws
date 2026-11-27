@@ -206,7 +206,8 @@ def rcj_obstacle_boxes(s: FieldSpec):
     boxes = []
     for it in rcj_field.scene(s.rcj_cfg()):
         n = it['name']
-        if it['kind'] == 'box' and it['collision'] and ('wall' in n or n.endswith('_back') or '_side_' in n):
+        if it['kind'] == 'box' and it['collision'] and ('wall' in n or n.endswith('_back') or '_side_' in n
+                                                         or n.endswith('_flag')):
             boxes.append((n, it['pos'][0], it['pos'][1], it['size'][0], it['size'][1]))
     return boxes
 

@@ -42,7 +42,7 @@ from tf2_msgs.msg import TFMessage
 from pinky_soccer_sim import rcj_field
 from pinky_soccer_sim.field import FieldSpec, resolve_dims
 
-BALL_R, BALL_M = 0.02135, 0.0459
+BALL_R, BALL_M = 0.02135, 0.04593     # golf ball 45.93 g (user, 2026-11-27)
 # collision bits: 1 = world (walls, goals, carpet), 2 = robots, 4 = ball
 WORLD_BITS, ROBOT_BITS, BALL_BITS = (1, 2 | 4), (2, 1 | 2 | 4), (4, 1 | 2)
 LIDAR_GROUP = {'yellow': 1, 'blue': 3}         # each robot's collision shapes; the other robot's lidar sees them
@@ -64,7 +64,7 @@ def quat_yaw(q):
 
 
 # ------------------------------------------------------------------------------------------------ model
-def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.00035, markings=True, hull_verts=0, visuals=True):
+def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.000747, markings=True, hull_verts=0, visuals=True):
     """Field + ball + yellow/blue Pinky -> compiled MjModel.  markings=False leaves out the painted lines (visual
     only).  hull_verts > 0 caps the collision hulls of the robot meshes (up to 11k vertices: the physics of
     several processes then fights over the CPU cache and does not scale - RL training uses 64).  visuals=False
@@ -101,7 +101,9 @@ def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.00035, markings=Tru
             shape, size = mujoco.mjtGeom.mjGEOM_BOX, [s / 2 for s in o['size']]
         g = spec.worldbody.add_geom(name=f'field_{i}_{o["name"]}', type=shape, size=size, pos=list(o['pos']),
                                     quat=yaw_quat(o.get('yaw', 0.0)), rgba=list(o['color']))
-        if o['collision']:
+        if o['collision'] and o.get('physics', True) is False:
+            g.contype, g.conaffinity, g.group = 0, 0, 0                 # lidar sees it (group 0), nothing hits it
+        elif o['collision']:
             g.contype, g.conaffinity, g.group = WORLD_BITS[0], WORLD_BITS[1], 0
             g.friction = [float(cfg.get('friction', 0.8)), 0.005, 0.0001]
         else:
@@ -170,6 +172,12 @@ def build_scene(out_dir, style, cam_tilt, poses, ball_roll=0.00035, markings=Tru
         if team in LIDAR_GROUP and model.geom_contype[i] == 2:
             model.geom_conaffinity[i] = ROBOT_BITS[1]
             model.geom_group[i] = LIDAR_GROUP[team]
+            if model.geom_rgba[i][3] == 0.0:
+                # opaque (2026-11-27): transparent shapes are skipped by the lidar rays and by the cameras - the
+                # other robot's lidar saw only its lidar head, its camera never saw the robot at all
+                # coloured like the robot (2026-11-27): white body, black wheels / caster
+                model.geom_rgba[i] = [0.06, 0.06, 0.06, 1.0] if ('wheel' in name or 'caster' in name) \
+                    else [0.88, 0.88, 0.90, 1.0]
     return model, (L, W, G, strip)
 
 
@@ -247,7 +255,9 @@ class Robot:
         self.prev_wheels = sim.data.qpos[self.q[:2]].copy()
         self.prev_yaw = self._true_yaw()
         self.cmd, self.cmd_t = (0.0, 0.0), -math.inf
-        node.create_subscription(Twist, f'/{team}/cmd_vel', self._cmd, 10)
+        # only the newest command counts (dbg5, 2026-11-27: a 10-deep queue served one message per spin made
+        # every command ~0.58 s old - the robots overshot the ball and rocked back and forth)
+        node.create_subscription(Twist, f'/{team}/cmd_vel', self._cmd, 1)
         self.odom_pub = node.create_publisher(Odometry, f'/{team}/odom', 10)
         self.joint_pub = node.create_publisher(JointState, f'/{team}/joint_states', 10)
         self.scan_pub = node.create_publisher(LaserScan, f'/{team}/scan', qos_profile_sensor_data)
@@ -455,7 +465,7 @@ class SoccerSim:
 
     def spin_ros(self):
         for ex in self.execs:
-            ex.spin_once(timeout_sec=0.0)
+            ex.spin_once(timeout_sec=0.0)      # (the cmd queue keeps only the newest command: no lag)
 
     def advance(self):
         self._apply_poses()
@@ -488,11 +498,18 @@ class SoccerSim:
             self.last_cam = self.data.time
             if self.renderer is None:
                 self.renderer = mujoco.Renderer(self.model, self.camera['height'], self.camera['width'])
-                self.option = mujoco.MjvOption()
-                self.option.geomgroup[1] = self.option.geomgroup[3] = 0      # hide collision shapes
-                self.option.geomgroup[4] = 0                                  # and the robot meshes
-            for r in self.robots.values():
-                r.publish_image(self.renderer, self.option, now)
+                # each camera: no detailed robot meshes (slow), but the OTHER robot's simple collision shapes -
+                # the camera sees the other robot and it can hide the ball (user, 2026-11-27: the robot cameras
+                # showed the ball but never the other robot); our own shapes stay hidden (inside the camera)
+                self.options = {}
+                for team in self.robots:
+                    o = mujoco.MjvOption()
+                    o.geomgroup[1] = o.geomgroup[3] = 0
+                    o.geomgroup[4] = 0
+                    o.geomgroup[LIDAR_GROUP['blue' if team == 'yellow' else 'yellow']] = 1
+                    self.options[team] = o
+            for t, r in self.robots.items():
+                r.publish_image(self.renderer, self.options[t], now)
             T['camera'] = T.get('camera', 0.0) + time.perf_counter() - t2
 
     def publish_truth(self, now):
@@ -539,7 +556,7 @@ def main(args=None):
     ap.add_argument('--blue-pose', default='auto', help='x,y,yaw (auto = +L/4, 0, pi)')
     ap.add_argument('--cam-tilt', type=float, default=20.0)
     ap.add_argument('--max-linear', type=float, default=0.30)
-    ap.add_argument('--ball-roll', type=float, default=0.00035, help='rolling friction [m]; larger = stops sooner')
+    ap.add_argument('--ball-roll', type=float, default=0.000747, help='rolling friction [m]; larger = stops sooner')
     ap.add_argument('--output-dir', default='/tmp/pinky_soccer/mujoco')
     opt, _ = ap.parse_known_args(args)
 

@@ -90,6 +90,7 @@ def _robot(context, team, domain, gz_prefix, pose, L, W, G, strip, v, sim='gz'):
     striker = solo_striker_params(L, W, G, strip, float(v('max_speed')), 
                                   match=True, sim_time=True)
     striker['policy_path'] = v(f'policy_{team}')       # '' = rule-based striker
+    striker['play_debug'] = v('play_debug').lower() == 'true'
     striker.update({'team': team, 'goal_x': attack_x, 'attack_yaw': attack_yaw,
                     'ready_offset': _start_offset(v),           # on the white line in front of the own goal
                     # avoid_opponent (default): the other robot nearby is an obstacle to go round
@@ -124,7 +125,7 @@ def _robot(context, team, domain, gz_prefix, pose, L, W, G, strip, v, sim='gz'):
     actions += [
         # --- PC-side stack of this robot ---
         include('pinky_soccer_nav', 'nav.launch.py',
-                {**field_forward(), 'namespace': ns, 'max_linear': v('max_speed'),
+                {**field_forward(), 'namespace': ns, 'max_linear': v('max_speed'),   # top speed (user, 2026-11-27)
                  'real_robot': 'true',             # lidar-weighted AMCL (pushing / spinning makes the wheels slip)
                  'initial_x': str(x), 'initial_y': str(y), 'initial_yaw': str(yaw)}),
 
@@ -168,7 +169,14 @@ def launch_setup(context):
                 '--yellow-pose=' + ','.join(map(str, ypose)), '--blue-pose=' + ','.join(map(str, bpose)),
                 '--cam-tilt', v('cam_tilt_deg'), '--max-linear', str(float(v('max_speed')) + 0.02),
                 '--ball-roll', v('ball_roll')] + (['--simple-robots'] if v('simple_robots') == 'true' else [])
-                + (['--record', v('record')] if v('record') else []))]
+                )]
+        if v('record'):
+            # the match video in its own process (inside the simulator it slowed the game to ~0.5x real time)
+            sim_actions.append(Node(
+                package='pinky_soccer_sim', executable='sim_recorder', output='screen',
+                additional_env={'MUJOCO_GL': 'glfw'},
+                arguments=['--output', v('record'), '--fps', v('record_fps'), '--field-style', v('field_style'),
+                           '--cam-tilt', v('cam_tilt_deg'), '--yellow-domain', str(yd), '--blue-domain', str(bd)]))
     else:
         sim_actions = [
             SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH', res),
@@ -213,11 +221,13 @@ def generate_launch_description():
         DeclareLaunchArgument('yellow_domain', default_value='37'),
         DeclareLaunchArgument('blue_domain', default_value='38'),
         DeclareLaunchArgument('backend', default_value='hsv', description='hsv (camera) | gt'),
-        DeclareLaunchArgument('max_speed', default_value='0.28', description='m/s top speed (moving to places; ball play itself is slower, ball_play.py)'),
+        DeclareLaunchArgument('max_speed', default_value='0.35', description='m/s top speed (moving to places; ball play itself is slower, ball_play.py)'),
         DeclareLaunchArgument('start_offset', default_value='line',
                               description="start pose from the own goal line [m]; 'line' = on the penalty line"),
         DeclareLaunchArgument('cam_tilt_deg', default_value='20'),
-        DeclareLaunchArgument('win_score', default_value='5'),
+        DeclareLaunchArgument('record_fps', default_value='20', description='video frames per simulated second'),
+        DeclareLaunchArgument('play_debug', default_value='false', description='striker DBG lines every 0.2 s'),
+        DeclareLaunchArgument('win_score', default_value='0'),   # 0: no 'first to N' - the timed match decides
         DeclareLaunchArgument('auto_ball_reset', default_value='false'),   # true: referee moves the ball itself (tests)
         DeclareLaunchArgument('record', default_value='',
                               description='video file (.mp4) recorded by the simulator itself, e.g. ~/pinky_rl/videos/match.mp4'),
@@ -231,10 +241,10 @@ def generate_launch_description():
         DeclareLaunchArgument('avoid_opponent', default_value='true',
                               description='true: the other robot is an obstacle (slow down / go round it); '
                                           'false: contact allowed'),
-        DeclareLaunchArgument('ball_roll', default_value='0.00035', description='MuJoCo ball rolling friction [m]'),
+        DeclareLaunchArgument('ball_roll', default_value='0.000747', description='MuJoCo ball rolling friction [m] = rolling coefficient 0.035 x ball radius (user, 2026-11-27)'),
         DeclareLaunchArgument('headless', default_value='false'),
         # attack drill: yellow alone, the ball dropped at random spots, drill_time s to score each
-        DeclareLaunchArgument('game_mode', default_value='attack_defense',
+        DeclareLaunchArgument('game_mode', default_value='free',
                               description='attack_defense (roles, 1-minute attacks) | free (both attack)'),
         DeclareLaunchArgument('drill', default_value='false'),
         DeclareLaunchArgument('drill_time', default_value='60'),

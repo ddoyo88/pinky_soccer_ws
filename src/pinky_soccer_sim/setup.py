@@ -30,6 +30,7 @@ setup(
             'generate_world = pinky_soccer_sim.generate_world:main',
             'generate_map = pinky_soccer_sim.generate_map:main',
             'mujoco_soccer = pinky_soccer_sim.mujoco_soccer:main',
+            'sim_recorder = pinky_soccer_sim.sim_recorder:main',
         ],
     },
 )

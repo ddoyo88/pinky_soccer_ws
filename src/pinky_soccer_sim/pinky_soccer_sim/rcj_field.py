@@ -27,6 +27,7 @@ DEFAULT_CFG = {
     # construction / rendering / physics assumptions (not measured)
     'wall_thickness': 0.01, 'floor_thickness': 0.02, 'thin_black_line': 0.002,
     'friction': 0.8, 'arc_segments': 128,
+    'flag_height': 0.35, 'flag_pole': 0.03,      # goal-centre flag pole (top height, square side)
 }
 
 
@@ -79,6 +80,17 @@ def scene(cfg):
             [depth+wall+cfg['line_width'], cfg['goal_width']+2*wall, wall], color)
         box(f'{name}_goal_floor', [sign*(front+depth/2), 0, .00015],
             [depth, cfg['goal_width'], .0001], color, False)
+        # tall flag on the centre of the goal roof (not RCJ): the goal itself is below the lidar plane,
+        # the pole sticks out above it, so the lidar sees where the goal is (a bump in front of the end wall)
+        fh, fp = cfg.get('flag_height', 0), cfg.get('flag_pole', 0.03)
+        if fh > 0:
+            top = gh + wall
+            # at the BACK of the goal (dbg2, 2026-11-27: on the middle of the roof it caught the top of a robot's
+            # front in the goal mouth - it could not turn for 7 s); seen by the lidar only, no physics
+            fx = sign*(front+depth+wall/2)
+            box(f'{name}_goal_flag', [fx, 0, (top+fh)/2], [fp, fp, fh-top], color)
+            items[-1]['physics'] = False
+            box(f'{name}_goal_flag_cloth', [fx, 0.05, fh-0.04], [0.004, 0.10, 0.07], color, False)
 
     # Convex wedges meet on 45 degree corner seams; no overlaps or corner steps.
     ramp, rise = cfg['ramp_base'], cfg['ramp_rise']

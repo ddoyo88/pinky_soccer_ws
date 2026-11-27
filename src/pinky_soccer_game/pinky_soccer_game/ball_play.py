@@ -10,25 +10,25 @@ defend_cmd(...)  -> (v, w, mode)  keeper in front of the own goal; rush and clea
 """
 import math
 
-# speeds halved 2026-11-27 (user: the robots were too fast to control the ball).
+# full speeds again 2026-11-27 (free game: both attack, user wants top speed and hard shots).
 # numbers (2026-11-26, user: exact lining up was too slow and frustrating - move quickly, touch the ball a lot):
 # push once roughly behind the ball (0.30 rad), steps of 14 cm at 0.24 m/s, 0.7 rad round the ball per step.  (Learned numbers: scripts/tune_ball_play.py, ~/pinky_rl/ball_play_params*.json)
 P = {
-    'w_look': 0.9,        # rad/s max turn with the ball in / near the camera view (slow: no overshoot, no blur)
-    'w_far': 1.6,         # rad/s max turn with the ball well outside the view (nothing to lose there)
+    'w_look': 1.4,        # rad/s max turn with the ball in / near the camera view (slow: no overshoot, no blur)
+    'w_far': 1.4,         # rad/s max turn with the ball well outside the view (nothing to lose there)
     'view': 0.55,         # rad: 'near the camera view' (measured: the ball is seen within +-0.45 rad)
     'line_slow': 0.18,    # m from the boundary line: ...
-    'v_line': 0.08,       # ... drive at most this fast there (p02: taps / clears still crossed it by up to 4 cm)
+    'v_line': 0.15,       # ... drive at most this fast there (p02: taps / clears still crossed it by up to 4 cm)
     'k_look': 2.0,        # turn gain
     'look_tol': 0.15,     # rad: ball 'in the middle of the image'
     'look_fresh': 0.3,   # s: a camera sighting this recent counts as 'seen now'
-    'v_approach': 0.13,   # m/s driving at the ball while it stays in view (no stopping needed)
+    'v_approach': 0.35,   # m/s driving at the ball while it stays in view (no stopping needed)
     'step_d': 0.14,       # m: one small move
     'step_t': 0.6,        # s: ... or at most this long
     'step_turn': 0.7,     # rad: start the move once the heading is this close to it
-    'v_step': 0.12,       # m/s small moves
-    'v_push': 0.11,       # m/s dribble
-    'v_shot': 0.14,       # m/s shot (near the goal, lined up, nobody at the ball)
+    'v_step': 0.35,       # m/s small moves
+    'v_push': 0.32,       # m/s dribble
+    'v_shot': 0.35,       # m/s shot (near the goal, lined up, nobody at the ball)
     'push_tol': 0.2,     # rad: ball drifting this far off the middle while pushing -> stop and centre it
     'k_push': 1.6,        # steering gain while pushing (fine corrections)
     'w_push': 0.5,        # rad/s max steering while pushing
@@ -37,11 +37,16 @@ P = {
     'behind_tol': 0.3,   # rad round the ball: 'behind it'
     'line_margin': 0.07,  # m: move targets stay this far inside the boundary line
     # going round the ball on a square (user, 2026-11-26): straight legs corner to corner, a look after each
-    'square_h': 0.12,     # m ball centre -> square side (user: as small as possible; side 5.5 cm + ball 2.1 cm
+    'square_h': 0.13,     # m ball centre -> square side (2026-11-27: 0.11 left the WHEEL only ~1 cm off the
+                          # ball - wheel edge 0.077 m from the centre + ball 0.021 - it rubbed the ball, 'stepping on it'); (user: as small as possible; side 5.5 cm + ball 2.1 cm
                           #   -> ~4 cm clear along a side, corners 0.17 m off: the body corners clear the ball)
     'def_style': 'block', # defender: 'block' (never touches the ball, stands in the shot's way) | 'clear' (old)
-    'def_style_free': 'wander',  # the defender: 'wander' (moving obstacle round its goal, never plays the
-                          #   ball) | 'roam' (runs about its half) | 'block' (stands in the shot's way)
+    'def_style_free': 'shuttle',  # the defender: 'shuttle' (back and forth between two points in front of its goal),
+                          #   'wander' (random spots round its goal) | 'roam' (its half) | 'block' (shot's way)
+    'shuttle_d': 0.30,    # m in front of the goal line, +-shuttle_y: the two black neutral spots in front of the
+    'shuttle_y': 0.27,    #   goal (field_hardboard.yaml: neutral_distance_from_end 0.30, penalty_width 0.54)
+    'v_shuttle': 0.10,    # ... driven at this speed ...
+    'shuttle_keep': 0.25,  # ... stopping while the ball is this close
     'wander_x': (0.15, 0.55),  # m in front of the goal line: where it wanders ...
     'wander_y': 0.35,     # ... and this far to either side
     'wander_keep': 0.30,  # m: never closer than this to the ball (backs away)
@@ -57,23 +62,39 @@ P = {
     'sway_t': 3.2,        # ... with this period (s): about +-8 cm
     'sway_w': 0.6,        # rad/s nose swaying left / right ...
     'sway_wt': 1.6,       # ... with this period (s): about +-0.15 rad, the ball stays in view
-    'weave_ang': 0.25,    # rad the flick turns left / right of the target, alternating each touch (zig-zag)
-    'corner_shot': True,  # close to the goal: aim at a corner (angled shot) ...
+    'weave_ang': 0,    # rad the flick turns left / right of the target, alternating each touch (zig-zag)
+    'corner_shot': False,  # close to the goal: aim at a corner (angled shot) ...
     'corner_from': 0.90,  # ... from this far (ball -> goal) ...
     'corner_in': 0.06,    # ... this far inside the post
+    'straight_touch': True,  # at contact: straight on (no flick / zig-zag / dodge - wheels ran onto the ball)
     'tap': True,          # tap dribble: roughly behind the ball -> run into it, flick it toward the target
     'tap_tol': 1.0,       # rad round the ball that counts as 'roughly behind'
-    'v_tap': 0.13,        # m/s
-    'tap_contact': 0.14,  # m robot centre - ball centre: contact (the bumper is at 0.09 m)
+    'v_tap': 0.32,        # m/s
+    'tap_contact': 0.14,
+    'own_stuck_d': 0.15,  # m ball -> own goal line: no path behind it -> push it out sideways (exception)
+    'blind_d': 0.11,      # m robot centre -> remembered ball: under the camera (it sees from ~0.10 m) ...
+    'blind_age': 0.35,    # s ... and not seen for this long -> back off straight
+    'v_blind': 0.08,      # m/s
+    'tap_center': True,   # centre-then-tap dribble (user, 2026-11-27): ball ~5 cm before the camera -> slow turn
+                          # until it is in the middle of the image, then a straight tap, re-position, again
+    'align_d': 0.24,      # m robot centre -> ball: stop and centre here (user, 2026-11-27: ~10 cm in front of the
+                          # camera, not 5: bumper 0.09 + 0.10 + ball radius + margin)
+    'align_tol': 0.10,    # rad: 'in the middle of the image'
+    'w_align': 0.6,
+    'w_align_min': 0.25,  # rad/s floor of the centring turn      # rad/s: the slow centring turn
+    'tap_line_tol': 0.45, # rad round the ball off the line ball -> target: still tap (else the square first)
+    'tap_push': 0.10,     # m the tap run goes on through the ball
+    'tap_run_t': 1.5,     # s straight run of a tap (no steering)
+    'tap_rest_t': 0.15,    # s looking after a tap (where did it roll)  # m robot centre - ball centre: contact (the bumper is at 0.09 m)
     'k_flick': 2.5,       # at contact: turn gain toward the target ...
     'w_flick': 1.5,       # ... up to this fast (the nose sweeps the ball sideways toward the target)
-    'kick_near': 0.50,    # m ball -> target: the run-up kick there (when nearly lined up)
+    'kick_near': 0.7,    # m ball -> target: the run-up kick there (when nearly lined up)
     'kick': True,         # behind the ball: run-up kick (WINDUP -> KICK) instead of a slow push
-    'v_windup': 0.08,     # m/s backing off for the run-up ...
+    'v_windup': 0.15,     # m/s backing off for the run-up ...
     'windup_d': 0.22,     # ... until this far from the ball ...
     'windup_t': 0.8,      # ... or this long
     'kick_t': 1.0,        # s at full speed (v_shot) into the ball
-    'v_leg': 0.12,        # m/s along a leg
+    'v_leg': 0.35,        # m/s along a leg
     'leg_d': 0.45,        # m at most per leg (one side of the square is 0.36 m)
     'leg_t': 2.2,         # s at most per leg
     'leg_turn': 0.25,     # rad: line up this well before driving a leg (a straight leg, no curve)
@@ -164,6 +185,12 @@ def attack_cmd(me, ball, age, target, half_len, half_w, state, now, free=True, g
     return _line_slow(me, v, half_len, half_w, goal_w), w, mode
 
 
+def _tap_time(d):
+    """Length of the straight tap run: reach the ball (bumper 0.042 m + ball radius) and push it on
+    tap_push m, plus the speed-up (a fixed 0.7 s ended right at the first touch - the ball hardly moved)."""
+    return P['tap_run_t']           # user, 2026-11-27: a fixed 1.5 s straight run (was distance based)
+
+
 def _attack(me, ball, age, target, half_len, half_w, state, now, free=True, give_way=False, near_goal=0.60,
             behind_tol=None, v_push=None, opp=None, goal_w=None):
     """me (x, y, yaw), ball (x, y) remembered position, age: s since the camera saw it (0 while it is carried
@@ -188,6 +215,18 @@ def _attack(me, ball, age, target, half_len, half_w, state, now, free=True, give
         else:
             state.pop('corner', None)
         tx += math.copysign(0.10, tx)
+        # exception (user, 2026-11-27): the ball stopped right in front of OUR goal (after the other robot's
+        # shot) - the spot behind it toward the target lies inside our goal, no path to push it up the field ->
+        # push it sideways along the goal line out of the field; the referee restarts from the centre
+        own_x = -math.copysign(half_len, tx)
+        if goal_w is not None and abs(bx - own_x) < P['own_stuck_d'] and abs(by) < goal_w / 2 + 0.04:
+            side = math.copysign(1.0, by) if abs(by) > 0.01 else (1.0 if y >= by else -1.0)
+            if abs(y - by) > 0.05 and (y - by) * side > 0:
+                side = -side                                 # we are on that side already: push the other way
+            tx, ty = bx, side * (half_w + 0.30)
+            state['own_stuck'] = True
+        else:
+            state.pop('own_stuck', None)
     ux, uy = tx - bx, ty - by
     n = math.hypot(ux, uy) or 1e-6
     ux, uy = ux / n, uy / n
@@ -243,9 +282,26 @@ def _attack(me, ball, age, target, half_len, half_w, state, now, free=True, give
         # chased on would be driven anywhere - once into our own goal (drill ep 28)
         ahead = (bx - x) * ux + (by - y) * uy > 0.0        # (0.5 * d was too strict: more balls kicked out)
         if now - state.get('kt', now) < P['kick_t'] and ahead and (abs(bearing) < 0.5 or d < 0.12):
-            return P['v_shot'], _clip(P['k_push'] * bearing, P['w_push']), 'KICK'
+            return P['v_shot'], (0.0 if d < 0.16 else _clip(P['k_push'] * bearing, P['w_push'])), 'KICK'
         state['phase'] = 'LOOK'                           # kicked: look where the ball went, follow it
         return 0.0, _turn(bearing), 'LOOK'
+    if d < P['blind_d'] and age > P['blind_age'] and state.get('tap_go') is None and phase not in ('KICK',):
+        # ball right at the nose (user, 2026-11-27): it covers the camera - ball or just dark? Never stand there:
+        # back off straight (both wheels the same) until the camera sees it again
+        state['phase'] = 'LOOK'
+        state.pop('step', None)
+        return -P['v_blind'], 0.0, 'BLIND_BACK'
+    if P['tap'] and P['tap_center']:
+        # the straight tap run of the centre-then-tap dribble (below) runs to the end, then a short look
+        go = state.get('tap_go')
+        if go is not None:
+            missed = age < 0.3 and d > 0.12 and abs(bearing) > 0.40   # rolled off to the side: stop, look again
+            if now - go < state.get('tap_T', P['tap_run_t']) and not missed:
+                return P['v_tap'], 0.0, 'TAP_HIT'
+            state.pop('tap_go', None)
+            state['tap_rest'] = now
+        if now - state.get('tap_rest', -9.0) < P['tap_rest_t']:
+            return 0.0, _clip(P['k_look'] * bearing, P['w_align']), 'TAP_REST'   # watch where it rolled
     # tap dribble (user, 2026-11-26: just go for the goal - no measuring of lines, tap it along, lively): roughly
     # behind the ball (within tap_tol round it) and the ball known -> run at the spot just behind it; at the
     # moment of contact turn the nose toward the target, so the ball is flicked a little sideways toward it.
@@ -272,10 +328,13 @@ def _attack(me, ball, age, target, half_len, half_w, state, now, free=True, give
                 err = _wrap(math.atan2(ay - y, ax - x) - yaw)
                 if abs(err) > 0.8:
                     return 0.0, _clip(P['k_look'] * err, P['w_far']), 'LINE_TAP'
-                return P['v_tap'] * max(0.3, math.cos(err)), _clip(2.5 * err, P['w_far']), 'LINE_TAP'
+                if abs(err) > 0.25:
+                    return 0.0, _clip(P['k_look'] * err, P['w_align']), 'LINE_TAP'   # turn first, then straight
+                return P['v_tap'], 0.0, 'LINE_TAP'              # lined up: both wheels the same
             fx, fy = bx + lx * 0.30 + ix * 0.20, by + ly * 0.30 + iy * 0.20     # forward and inward
             to_f = _wrap(math.atan2(fy - y, fx - x) - yaw)
-            return P['v_tap'], _clip(P['k_flick'] * to_f, P['w_flick']), 'LINE_FLICK'
+            state['tap_go'] = now; state['tap_T'] = _tap_time(d)                            # straight through (user: no angled touches),
+            return P['v_tap'], 0.0, 'TAP_HIT'                # a timed tap like any other - then look again
     if P['tap'] and not at_line and abs(dphi) < P['tap_tol'] and age < 0.8 and phase not in ('STEP',):
         to_t = _wrap(math.atan2(ty - y, tx - x) - yaw)
         if math.hypot(tx - bx, ty - by) < P['kick_near'] and abs(dphi) < 0.35 and d < 0.30 and free:
@@ -283,16 +342,54 @@ def _attack(me, ball, age, target, half_len, half_w, state, now, free=True, give
             return -P['v_windup'], _clip(P['k_push'] * bearing, P['w_push']), 'WINDUP'
         state['phase'] = 'LOOK'
         state.pop('step', None)
-        if d > P['tap_contact']:
+        if P['tap_center']:
+            # centre-then-tap dribble (user, 2026-11-27): get behind the ball, ~5 cm in front of the camera
+            # stop and turn SLOWLY until the ball is in the middle of the image, then a straight run (no
+            # steering) - a tap - then take the next spot, centre again, tap again
+            if d < P['align_d'] + 0.03:
+                if abs(dphi) > P['tap_line_tol']:
+                    pass                                     # not on the line to the target: square below
+                elif abs(bearing) < P['align_tol'] and age < 0.5 and d >= 0.17:
+                    state['tap_go'] = now; state['tap_T'] = _tap_time(d)                    # centred: tap
+                    return P['v_tap'], 0.0, 'TAP_HIT'
+                else:
+                    if d < 0.17:
+                        return -0.10, 0.0, 'ALIGN_BACK'          # too close to judge: straight back first
+                    # slow turn to the centre, but never slower than w_align_min (it crept for 2.4 s: live58)
+                    w = _clip(1.2 * bearing, P['w_align'])
+                    if abs(w) < P['w_align_min']:
+                        w = math.copysign(P['w_align_min'], bearing)
+                    return 0.0, w, 'TAP_ALIGN'
+            if abs(dphi) > P['tap_line_tol'] and d < P['align_d'] + 0.05:
+                state['phase'] = 'LOOK'                      # off the line close up -> square round the ball
+            else:
+                ax, ay = bx - ux * 0.20, by - uy * 0.20          # the spot behind the ball (camera ~10 cm off)
+                err = _wrap(math.atan2(ay - y, ax - x) - yaw)
+                if math.hypot(ax - x, ay - y) < 0.04:
+                    err = bearing
+                if d < 0.40:
+                    # close to the ball (user, 2026-11-27): turn on the spot until lined up, then both wheels the
+                    # same - a dead straight run, no curve
+                    if abs(err) > 0.12:
+                        return 0.0, _clip(P['k_look'] * err, P['w_align']), 'TAP_TURN'
+                    return P['v_tap'], 0.0, 'TAP'
+                if abs(err) > 0.8:
+                    return 0.0, _clip(P['k_look'] * err, P['w_far']), 'TAP'      # turn on the spot first
+                return P['v_tap'] * max(0.3, math.cos(err)), _clip(2.5 * err, P['w_far']), 'TAP'
+        elif d > P['tap_contact']:
             state['last_tap'] = 'run'
             ax, ay = bx - ux * 0.04, by - uy * 0.04          # just behind the ball (target side opposite)
             err = _wrap(math.atan2(ay - y, ax - x) - yaw)
             if abs(err) > 0.8:
                 return 0.0, _clip(P['k_look'] * err, P['w_far']), 'TAP'
             return P['v_tap'] * max(0.3, math.cos(err)), _clip(2.5 * err, P['w_far']), 'TAP'
-        # contact: keep driving, nose toward the target (flick).  The keeper standing between the ball and the
-        # goal: flick toward the open side of the goal instead of straight into it (p02: every tap ran into it)
-        if opp is not None and goal_w is not None:
+        # contact: straight through the ball, only small corrections to keep it in the middle of the image (user,
+        # 2026-11-27: the angled touches - flick, zig-zag, dodge - made the wheels run onto the ball)
+        if P['tap_center']:
+            pass                                             # off the line close up: the square below
+        elif P['straight_touch']:
+            return P['v_tap'], _clip(P['k_push'] * bearing, P['w_push']), 'TAP_STRAIGHT'
+        elif opp is not None and goal_w is not None:
             ox, oy = opp[0] - bx, opp[1] - by
             along = ox * ux + oy * uy                        # keeper in front of the ball toward the goal ...
             across = -ox * uy + oy * ux
@@ -303,15 +400,16 @@ def _attack(me, ball, age, target, half_len, half_w, state, now, free=True, give
                 gx2, gy2 = tx, ty + side * (goal_w / 2 - 0.05) * (1.0 if abs(ux) > 0.5 else 0.0)
                 to_t = _wrap(math.atan2(gy2 - y, gx2 - x) - yaw)
                 return P['v_tap'], _clip(P['k_flick'] * to_t, P['w_flick']), 'TAP_DODGE'
-        # zig-zag dribble (user, 2026-11-26): each touch flicks the ball a little to the other side of the line
-        # to the target - the ball weaves forward, the run-up is still straight
-        if state.get('last_tap') != 'contact':
-            state['weave'] = -state.get('weave', 1.0)    # a new touch: the other side
-        state['last_tap'] = 'contact'
-        # (not near our own goal: a ball flicked sideways there went in twice - offline drill)
-        far = math.hypot(tx - bx, ty - by) > P['corner_from'] and math.hypot(bx + tx, by) > 0.60
-        to_w = to_t + (state.get('weave', 1.0) * P['weave_ang'] if far else 0.0)
-        return P['v_tap'], _clip(P['k_flick'] * _wrap(to_w), P['w_flick']), 'TAP_FLICK'
+        if not P['tap_center']:
+            # zig-zag dribble (user, 2026-11-26): each touch flicks the ball a little to the other side of the line
+            # to the target - the ball weaves forward, the run-up is still straight
+            if state.get('last_tap') != 'contact':
+                state['weave'] = -state.get('weave', 1.0)    # a new touch: the other side
+            state['last_tap'] = 'contact'
+            # (not near our own goal: a ball flicked sideways there went in twice - offline drill)
+            far = math.hypot(tx - bx, ty - by) > P['corner_from'] and math.hypot(bx + tx, by) > 0.60
+            to_w = to_t + (state.get('weave', 1.0) * P['weave_ang'] if far else 0.0)
+            return P['v_tap'], _clip(P['k_flick'] * _wrap(to_w), P['w_flick']), 'TAP_FLICK'
     if phase == 'PUSH':
         # pushing: keep the ball in the middle of the image with small corrections; it drifts off -> stop, look
         if behind or d < 0.14:
@@ -320,7 +418,7 @@ def _attack(me, ball, age, target, half_len, half_w, state, now, free=True, give
                 lined = (bx - x) * ux + (by - y) * uy > 0 and abs(_wrap(math.atan2(uy, ux) - yaw)) < 0.25
                 shot = free and lined and math.hypot(tx - bx, ty - by) < near_goal
                 v = P['v_shot'] if shot else vp
-                return v, _clip(P['k_push'] * bearing, P['w_push']), 'SHOT' if shot else 'PUSH'
+                return v, (0.0 if d < 0.16 else _clip(P['k_push'] * bearing, P['w_push'])), 'SHOT' if shot else 'PUSH'
         state['phase'] = 'LOOK'
         return 0.0, _turn(bearing), 'LOOK'
     if phase == 'STEP':
@@ -412,6 +510,11 @@ def defend_cmd(me, ball, age, own_goal_x, half_len, half_w, goal_w, state, now, 
     ball (small moves, look again); a ball within clear_dist of the goal -> go at it and clear it toward the
     centre line / out of the field.  Never past the centre line.  Far from the goal (the roles just swapped)
     -> run back at full speed.  Returns (v, w, mode)."""
+    if P['def_style_free'] == 'shuttle':
+        v, w, mode = _shuttle(me, ball, age, own_goal_x, half_len, half_w, goal_w, state, now)
+        vm = P['roam_v'] if mode == 'RUN_BACK' else P['v_shuttle']
+        v = max(-vm, min(vm, v))
+        return _line_slow(me, _own_half_guard(me, v, own_goal_x), half_len, half_w, goal_w), w, mode
     if P['def_style_free'] == 'wander':
         # moving obstacle (user, 2026-11-26): never plays the ball, never goes near it or the other robot
         v, w, mode = _wander(me, ball, age, own_goal_x, half_len, half_w, goal_w, state, now)
@@ -451,6 +554,34 @@ def defend_cmd(me, ball, age, own_goal_x, half_len, half_w, goal_w, state, now, 
     else:
         v, w, mode = _defend(me, ball, age, own_goal_x, half_len, half_w, goal_w, state, now, clear_dist, give_way)
     return _line_slow(me, _own_half_guard(me, v, own_goal_x), half_len, half_w, goal_w), w, mode
+
+
+def _shuttle(me, ball, age, own_goal_x, half_len, half_w, goal_w, state, now):
+    """Shuttling keeper (user, 2026-11-27): back and forth between two points in front of its own goal
+    (shuttle_d from the goal line, just inside the posts), lined up with the goal line - forward one way, reverse
+    the other, no turning round.  It never plays the ball: a ball within shuttle_keep -> it stops and waits.
+    Far from the goal (after attacking) it first runs back (the wander code does that)."""
+    x, y, yaw = me
+    inward = -math.copysign(1.0, own_goal_x)
+    if inward * (x - own_goal_x) > P['wander_x'][1] + 0.15 or abs(y) > P['wander_y'] + 0.25:
+        return _wander(me, ball, age, own_goal_x, half_len, half_w, goal_w, state, now)    # RUN_BACK
+    if ball is not None and math.hypot(ball[0] - x, ball[1] - y) < P['shuttle_keep']:
+        return 0.0, 0.0, 'SHUTTLE_WAIT'
+    lx = own_goal_x + inward * P['shuttle_d']
+    ly = P['shuttle_y']
+    side = state.get('shuttle_side', 1.0)
+    tx, ty = lx, side * ly
+    if math.hypot(tx - x, ty - y) < 0.04:                  # reached this end: the other one next
+        side = state['shuttle_side'] = -side
+        tx, ty = lx, side * ly
+    to = math.atan2(ty - y, tx - x)
+    err, sgn = _wrap(to - yaw), 1.0
+    err_b = _wrap(to + math.pi - yaw)
+    if abs(err_b) < abs(err):                              # the point behind us: reverse (no turning round)
+        err, sgn = err_b, -1.0
+    if abs(err) > 0.4:
+        return 0.0, _clip(P['k_look'] * err, P['w_look']), 'SHUTTLE'
+    return sgn * P['v_shuttle'] * max(0.3, math.cos(err)), _clip(2.0 * err, P['w_look']), 'SHUTTLE'
 
 
 def _wander(me, ball, age, own_goal_x, half_len, half_w, goal_w, state, now):

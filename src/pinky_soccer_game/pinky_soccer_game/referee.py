@@ -98,10 +98,11 @@ class Referee(Node):
         self.declare_parameter('robot_front', 0.049)       # bumper front, ahead of base_footprint
         # match rule: no kickoff team - every (re)start puts the ball on the centre spot and both robots go at once.
         # kickoff_rule:=true brings back the old kickoff (first yellow, then the conceding team, 5 cm ball)
-        self.declare_parameter('kickoff_rule', False)
-        self.declare_parameter('kickoff_gap', 0.05)        # ball gap in front of the kicking robot's bumper
+        self.declare_parameter('kickoff_rule', True)    # user, 2026-11-27: yellow kicks off first again
+        self.declare_parameter('kickoff_gap', 0.15)        # ball gap in front of the kicking robot's bumper (0.05 sat in
+                                                           # the camera's blind spot: the robot backed off first)
         self.declare_parameter('kickoff_touch', 0.03)      # ball moved this far -> kickoff taken
-        self.declare_parameter('kickoff_timeout', 2.0)     # s; then the ball is open for both anyway
+        self.declare_parameter('kickoff_timeout', 8.0)     # s; then the ball is open for both anyway
         self.declare_parameter('reset_robots', False)      # teleporting the robot breaks AMCL; keep False
         self.declare_parameter('match_seconds', 0.0)       # 0 = unlimited
         self.declare_parameter('match_control', False)
@@ -456,9 +457,9 @@ class Referee(Node):
         if self.kickoff != 'OPEN':
             self._event(f'경기 시작 - {self.kickoff} 킥오프')
         elif not self.goals:
-            self._event('경기 시작 - 가운데 공, 노랑 선공 (파랑은 2초 뒤 출발)')
+            self._event('경기 시작 - 가운데 공, 둘 다 출발')
         else:
-            self._event('경기 시작 - 가운데 공 (직전 득점 팀은 2초 뒤 출발)')
+            self._event('경기 시작 - 가운데 공, 둘 다 출발')
 
     def _goal(self, team, now):
         """Counted automatically; the conceding team kicks off from the centre spot."""
@@ -502,7 +503,7 @@ class Referee(Node):
             self._event(f'{line}  -  {name} 세레모니 후 경기 종료')
         else:
             self.finish_after_goal = None
-            self._event(f'{line}  -  {name} 세레모니 (제자리 1바퀴), 그 다음 가운데에서 다시 시작')
+            self._event(f'{line}  -  {name} 세레모니 (자기 진영에서 1바퀴), 그 다음 가운데에서 다시 시작')
 
     def _celebration_over(self, now):
         """The scorer reported CELEBRATE_DONE (after at least goal_pause), or the timeout ran out."""
@@ -720,11 +721,18 @@ class Referee(Node):
 
     def _centre_ball(self, why):
         """Put the ball back on the centre spot - unless a robot stands on it right now (try again next tick)."""
-        for name in ('pinky_yellow', 'pinky_blue'):
-            p = self.tracker.get(name)
-            if p is not None and math.hypot(p[0], p[1]) < 0.12:
+        spot = (0.0, 0.0)
+        bots = [self.tracker.get(n) for n in ('pinky_yellow', 'pinky_blue')]
+        if any(p is not None and math.hypot(p[0], p[1]) < 0.12 for p in bots):
+            # a robot stands on the centre spot (i01: a robot waiting there blocked the restart for 6 min) ->
+            # 0.25 m up or down the centre line, the one farther from the robots
+            def clear(y):
+                return min(math.hypot(p[0], p[1] - y) for p in bots if p is not None)
+            y = max((0.25, -0.25), key=clear)
+            if clear(y) < 0.15:
                 return False
-        self._respot(0.0, 0.0)
+            spot = (0.0, y)
+        self._respot(*spot)
         self._event(why)
         self.closer_pending = True          # next tick: the robot closer to the ball takes it (after any swap)
         return True
@@ -746,7 +754,7 @@ class Referee(Node):
                                   self.get_parameter('ready_offset').value)
             d_own = -self.L / 2 if dfn == 'pinky_yellow' else self.L / 2
             ok = math.hypot(a[0] - sx, a[1] - sy) < 0.08 and abs(d[0] - d_own) < 0.60
-        if ok or now - self.regroup_t0 > 12.0:
+        if ok or now - self.regroup_t0 > 8.0:
             self.regroup_t0 = None
             self.attack_t0, self.clock_running = now, False
             name = {'YELLOW': '노랑', 'BLUE': '파랑'}

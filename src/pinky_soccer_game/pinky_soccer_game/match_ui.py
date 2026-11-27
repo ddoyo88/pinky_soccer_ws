@@ -103,7 +103,7 @@ class MatchWindow:
         self.root.configure(bg='#101820')
         self.root.protocol('WM_DELETE_WINDOW', self.close)
 
-        tk.Label(self.root, text=f'PINKY PRO  ·  SOCCER  ·  {node.win_score}점 먼저 내면 승리',
+        tk.Label(self.root, text='PINKY PRO  ·  SOCCER',   # (no 'first to 5' any more: timed match, user 2026-11-27)
                  font=('DejaVu Sans', 12, 'bold'), fg='#a8bac8', bg='#101820').pack(pady=(18, 8))
         self.score_label = tk.Label(self.root, text='YELLOW  0  :  0  BLUE',
                                     font=('DejaVu Sans', 30, 'bold'), fg='white', bg='#101820')

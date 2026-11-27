@@ -46,7 +46,17 @@ class GuardedPublisher:
     def __init__(self, pub, guard):
         self.pub, self.guard = pub, guard
 
+    scale = 1.0          # whole-game speed scale (user, 2026-11-27: 'too fast - halve everything'), set by the node
+
+    zig_w, zig_t, zig_phase = 0.0, 1.6, 0.0     # zig-zag while driving straight ahead (set by the node)
+
     def publish(self, cmd):
+        cmd.linear.x *= self.scale
+        cmd.angular.z *= self.scale
+        if self.zig_w > 0.0 and cmd.linear.x > 0.10 and abs(cmd.angular.z) < 0.3:
+            # a slight zig-zag instead of a dead straight line (user, 2026-11-27: more unexpected situations) -
+            # heading swings about +-0.2 rad, ~2 cm sideways
+            cmd.angular.z += self.zig_w * math.sin(2 * math.pi * time.time() / self.zig_t + self.zig_phase)
         self.last_in = (cmd.linear.x, cmd.angular.z)
         out = self.guard(cmd)
         self.last_out = (out.linear.x, out.angular.z)
@@ -101,13 +111,21 @@ class Striker(Node):
                                            # robot 5 cm from its goal line -> 0.05 + 0.075 = 0.125)
         P('orbit_radius', 0.24)            # [m] circle around the ball when we are on the wrong side of it
                                            # (real robot: 0.32 = wide loop, room to line up for the shot)
+        P('zigzag_w', 0.8)                 # rad/s amplitude of the zig-zag when driving straight (0 = straight)
+        P('zigzag_period', 1.6)            # s one left-right swing
+        P('faceoff', False)                # face-off at the ball: both back 10 cm, the closer one plays (off: bumping is fine)
+        P('ball_centre_tol', 0.0)          # rad: ball this close to the image centre -> straight on, no avoiding
+                                           # (0 = off: user, 2026-11-27 'no bumping')
+        P('play_debug', False)             # log the ball play every 0.2 s (DBG lines)
+        P('speed_scale', 1.0)              # every direct command x this (user, 2026-11-27: back to top speed -
+                                           # fast moves and turns, mistakes happen - that is the game)
         P('celebrate', True)               # after OUR goal: drive between own goal and centre line, spin
         P('celebrate_turns', 1.0)          # full turns on the spot (user, 2026-11-26: 3 was too long)
         P('concede_centre', True)          # the other team scored: go to the centre line (on our side, away
                                            # from the scorer) first, then back to our start pose - not standing
                                            # in front of our goal where the scorer is
         P('concede_hold', 1.5)             # [s] wait at the centre-line point before going back
-        P('scorer_delay', 2.0)             # [s] after a restart the team that scored last waits this long
+        P('scorer_delay', 0.0)             # [s] after a restart the team that scored last waits this long
         P('first_kick', 'yellow')          # the match's first kickoff: this team goes, the other waits
                                            # scorer_delay (the same 3 s head start)
         P('celebrate_w', 3.0)              # [rad/s] spin speed (real wheels allow ~5.9)
@@ -126,7 +144,7 @@ class Striker(Node):
         P('rl_search_after', 3.0)          # [s] RL mode: ball unseen this long -> the rule-based search (back up,
                                            # turn, roam) until the camera sees it again, then the policy again
         P('line_guard', True)              # never drive over the white boundary line (camera, line/boundary)
-        P('robot_guard', True)             # never drive into the other robot (lidar): slow from 0.32 m centre
+        P('robot_guard', True)             # (user, 2026-11-27: on again) never drive into the other robot (lidar): slow from 0.32 m centre
                                            # distance, stop at 0.20 m - same rule as the RL training
         P('robot_front', 0.05)             # [m] base_footprint -> bumper front
         P('robot_back', 0.08)              # [m] base_footprint -> rear
@@ -204,10 +222,15 @@ class Striker(Node):
             self.create_subscription(String, '/game/attack', self._attack_msg, 10)
             other = 'blue' if self.get_parameter('team').value.lower() == 'yellow' else 'yellow'
             self.create_subscription(PointStamped, f'/{other}/ball/position_map', self._shared_ball, 10)
+            self.create_subscription(String, f'/{other}/ball/cam_dist', self._other_cam_d, 10)
 
         self.cmd_pub = GuardedPublisher(self.create_publisher(Twist, self.get_parameter('cmd_topic').value, 10),
                                         lambda c: self._line_guard(self._robot_guard(self._kick_circle_guard(c))))   # line last: moving
                                                                                             # apart never crosses it
+        self.cmd_pub.scale = float(self.get_parameter('speed_scale').value)
+        self.cmd_pub.zig_w = float(self.get_parameter('zigzag_w').value)
+        self.cmd_pub.zig_t = float(self.get_parameter('zigzag_period').value)
+        self.cmd_pub.zig_phase = float(np.random.uniform(0, 2 * math.pi))     # each robot its own rhythm
         self.line_pts, self.line_t, self.line_stops = np.zeros((0, 2)), 0.0, 0
         self.create_subscription(PoseArray, 'line/boundary', self._line, 10)
         self.rl, self.rl_t, self.rl_cmd = None, 0.0, (0.0, 0.0)
@@ -225,6 +248,7 @@ class Striker(Node):
         self.reseed_t = 0.0
         self.state_pub = self.create_publisher(String, 'game/state', 10)   # /<ns>/game/state
         self.opp_pub = self.create_publisher(PointStamped, 'opponent/position_map', 10)
+        self.cam_d_pub = self.create_publisher(String, 'ball/cam_dist', 10)
         self.nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self.create_timer(0.05, self.tick)
         self.get_logger().info(f'striker ready, goal target = {self.goal.tolist()} (click in RViz to change)')
@@ -236,9 +260,46 @@ class Striker(Node):
         self.ball = np.array([m.point.x, m.point.y])
         self.ball_t = time.time()
         self.own_ball_t = self.ball_t
+        pose = self.robot_pose()
+        if pose is not None:
+            # how far OUR camera sees the ball (a bigger ball in the image = nearer); shared with the other robot
+            # to decide who touches first (user, 2026-11-27)
+            self.own_cam_d = math.hypot(m.point.x - pose[0], m.point.y - pose[1])
+            self.cam_d_pub.publish(String(data=f'{self.own_cam_d:.3f}'))
         self.carrying = False
         if time.time() >= getattr(self, 'ball_reset_until', 0.0):
             self.ball_placed_until = 0.0                  # a real sighting replaces the placed position
+
+    def _other_cam_d(self, m):
+        try:
+            self.other_cam = (float(m.data), time.time())
+        except ValueError:
+            pass
+
+    def cam_priority(self):
+        """Who touches the ball first, from what each camera sees: True = us (the ball nearer / bigger in our
+        image), False = the other robot, None = no fresh view from both.  Same rule for both robots; a dead tie
+        goes to the defender of the nearer goal."""
+        now = time.time()
+        oc = getattr(self, 'other_cam', None)
+        if oc is None or now - oc[1] > 0.5 or now - getattr(self, 'own_ball_t', 0.0) > 0.5:
+            return None
+        mine = getattr(self, 'own_cam_d', 9.0)
+        if abs(mine - oc[0]) > 0.005:
+            new = mine < oc[0]
+        elif self.ball is None:
+            return None
+        else:
+            own = -self.goal[0]
+            new = abs(self.ball[0] - own) < abs(self.ball[0] + own)
+        # keep a decision at least 2 s, unless the other side is now clearly (5 cm) nearer (h01-h03: the two
+        # camera distances jittered round each other, both gave way in turn and nobody touched the ball)
+        held = getattr(self, 'cam_prio', None)
+        if held is not None and held[0] != new and now - held[1] < 2.0 and abs(mine - oc[0]) < 0.05:
+            return held[0]
+        if held is None or held[0] != new:
+            self.cam_prio = (new, now)
+        return new
 
     def _shared_ball(self, m):
         """The other robot's camera estimate of the ball (relayed, map frame; ~5-10 cm off - two localisations).
@@ -290,6 +351,12 @@ class Striker(Node):
 
     def _scan(self, m):
         self.scan = m
+        # the other robot from EVERY scan right when it arrives (user, 2026-11-27: the lidar picture must be live) -
+        # not only when the 20 Hz loop happens to ask
+        try:
+            self.estimate_opponent(self.robot_pose())
+        except Exception:                                  # (TF not ready yet at start-up)
+            pass
 
     def _map(self, m):
         self.map = (np.array(m.data, dtype=np.int8).reshape(m.info.height, m.info.width),
@@ -321,7 +388,7 @@ class Striker(Node):
                 self.get_parameter('team').value.lower() != self.get_parameter('first_kick').value.lower()
             # the robot that waits also keeps out of a 0.30 m circle round the ball until the other one has
             # played it (the kick-off was a face-off at the ball, 2026-11-25)
-            self.kick_circle = bool(self.scored_last or first)
+            self.kick_circle = bool(self.scored_last or first) and self.get_parameter('scorer_delay').value > 0
             self.kick_circle_t = time.time()
             if self.scored_last or first:     # we scored the last goal / not our first kickoff: head start
                 self.hold_until = time.time() + self.get_parameter('scorer_delay').value
@@ -350,44 +417,34 @@ class Striker(Node):
         self.spin_done, self.spin_last = 0.0, None
         self.celebrate_back = None          # first: straight back out of the goal area (set on the first tick)
         self.celebrate_spot = None          # then: spin right there
+        self.celebrate_lane = None
 
     def celebrate(self, rx, ry, ryaw):
-        """Our goal: go to the middle of our own half (between own goal and centre line), spin
-        `celebrate_turns` times on the spot, then report CELEBRATE_DONE (the referee waits for it)."""
-        # celebrate right where we are after backing out (rec2: crossing the field to the old spot in our own
-        # half ran into the conceding robot on its way to its start pose - both stood for 40 s)
-        if getattr(self, 'celebrate_spot', None) is None or self.spin_last is None and \
-                getattr(self, 'celebrate_back', None) is None:
-            self.celebrate_spot = None
-        cb = getattr(self, 'celebrate_back', None)
-        if self.celebrate_spot is None and not (cb and math.hypot(rx - cb[0], ry - cb[1]) < 0.15 and
-                                                time.time() - cb[2] < 1.5) and cb is not None:
-            self.celebrate_spot = np.array([rx, ry])
-        spot = self.celebrate_spot if self.celebrate_spot is not None else np.array([rx, ry])
-        dist = float(np.linalg.norm(spot - np.array([rx, ry])))
+        """Our goal (user, 2026-11-27): straight away drive BACKWARDS to our own start pose - no turning round,
+        no forward driving - then spin `celebrate_turns` times there and report CELEBRATE_DONE."""
+        n_att = np.array([math.cos(self.attack_yaw), math.sin(self.attack_yaw)])
+        home = self.goal - n_att * self.L + n_att * self.get_parameter('ready_offset').value
+        dist = float(np.linalg.norm(home - np.array([rx, ry])))
         target = self.get_parameter('celebrate_turns').value * 2 * math.pi
-        # right after the goal: reverse straight out first (user, 2026-11-26) - 0.35 m back along our heading (we
-        # face the goal we just scored in), no turning in front of it - then on to the celebration spot
-        cb = getattr(self, 'celebrate_back', None)
-        if cb is None and self.spin_last is None:
-            near_goal = abs(rx - self.goal[0]) < 0.45
-            self.celebrate_back = cb = ((rx, ry, time.time()) if near_goal else False)
-        if cb and math.hypot(rx - cb[0], ry - cb[1]) < 0.15 and time.time() - cb[2] < 2.5:   # a little (user)
-            self.set_state('CELEBRATE_BACK')
-            self.cancel_nav()
-            cmd = Twist()
-            from pinky_soccer_game.rl_policy import over_line_ahead
-            cmd.linear.x = 0.0 if over_line_ahead((rx, ry, ryaw), -0.10, self.L / 2, self.W / 2, self.G) else -0.10
-            self.cmd_pub.publish(cmd)
-            return
         if self.spin_last is None and dist > 0.06:
-            # direct steering (the other robot stands still during GOAL; Nav2 goals kept being re-sent/cancelled)
             self.set_state('CELEBRATE_GO')
             self.cancel_nav()
             opp = self.estimate_opponent((rx, ry, ryaw))
             self.play_ctx = ((rx, ry, ryaw), opp, None)
-            self.publish_play(self.direct_goto(rx, ry, ryaw, spot, self.attack_yaw, pos_tol=0.05,
-                                               vmax=self.get_parameter('v_approach').value))
+            back = wrap(ryaw + math.pi)                     # the robot's rear points along this heading
+            err = wrap(math.atan2(home[1] - ry, home[0] - rx) - back)
+            cmd = Twist()
+            if opp is not None:
+                c, sn = math.cos(ryaw), math.sin(ryaw)
+                ox, oy = c * (opp[0] - rx) + sn * (opp[1] - ry), -sn * (opp[0] - rx) + c * (opp[1] - ry)
+                if ox < 0.0 and abs(oy) < 0.20 and math.hypot(ox, oy) < 0.35:
+                    self.set_state('CELEBRATE_WAIT')     # the other robot right behind: let it move away first
+                    self.publish_play(cmd)
+                    return
+            cmd.angular.z = clip(2.0 * err, -1.5, 1.5)
+            if abs(err) < 0.8:
+                cmd.linear.x = -min(self.get_parameter('v_approach').value, 2.0 * dist) * math.cos(err) ** 2
+            self.publish_play(cmd)
             return
         self.cancel_nav()
         if self.spin_last is None:
@@ -423,7 +480,7 @@ class Striker(Node):
         if ref is None or math.hypot(x - ref[0], y - ref[1]) > 0.03 or self.rl_pp.get('mode') in ('WAIT', 'KEEP'):
             self.unjam_ref = (x, y, now)
             return False
-        if opp is None or math.hypot(opp[0] - x, opp[1] - y) > 0.23 or now - ref[2] < 2.0:
+        if opp is None or math.hypot(opp[0] - x, opp[1] - y) > 0.25 or now - ref[2] < 2.0:
             return False
         from pinky_soccer_game.rl_policy import over_line_ahead
         away = math.atan2(y - opp[1], x - opp[0])
@@ -468,6 +525,17 @@ class Striker(Node):
 
     def _rl_play(self, pose, now):
         """PLAY with the learned policy: a new action every 0.1 s (the training rate), repeated in between."""
+        me_team = self.get_parameter('team').value.upper()
+        if self.match_control and self.kickoff in ('YELLOW', 'BLUE') and self.kickoff != me_team:
+            # the other team kicks off (user, 2026-11-27: yellow first): wait facing the ball until it is touched
+            self.cancel_nav()
+            cmd = Twist()
+            if self.ball is not None:
+                cmd.angular.z = clip(2.0 * wrap(math.atan2(self.ball[1] - pose[1], self.ball[0] - pose[0]) - pose[2]),
+                                     -1.0, 1.0)
+            self.cmd_pub.publish(cmd)
+            self.set_state('KICKOFF_WAIT')
+            return
         if self._unjam(pose, now):
             return
         self._carry_ball(pose, now)
@@ -611,7 +679,7 @@ class Striker(Node):
             v, w, mode = ball_play.defend_cmd(pose, bf, age, own_x, self.L / 2, self.W / 2, self.G,
                                               self.rl_pp, now, give_way=self._give_way(pose),
                                               opp=self.estimate_opponent(pose))
-            self.rl_pp['mode'] = 'WAIT' if mode in ('KEEP', 'LOOK', 'BLOCK_HOLD', 'WANDER_LOOK') else mode
+            self.rl_pp['mode'] = 'WAIT' if mode in ('KEEP', 'LOOK', 'BLOCK_HOLD', 'WANDER_LOOK', 'SHUTTLE_WAIT', 'SHUTTLE') else mode
             if mode.startswith(('CLEAR_PUSH', 'CLEAR_SHOT', 'CLEAR_KICK', 'CLEAR_WINDUP', 'CLEAR_TAP')):
                 self.push_t = time.time()
             self.rl_cmd = (v, w)
@@ -619,6 +687,8 @@ class Striker(Node):
             vd = ball_play.P['v_def']                      # half the attacker's play speed
             if mode in ('ROAM', 'RUN_BACK'):
                 vd = ball_play.P['roam_v']                # roaming / running back to the goal: a little faster
+            elif mode == 'SHUTTLE':
+                vd = ball_play.P['v_shuttle']
             v = max(-vd, min(vd, v))
             cmd = Twist()
             cmd.linear.x = goal_mouth_guard(pose, v, self.L / 2, self.G, nose=0.09 + 0.25 * abs(v))
@@ -649,11 +719,97 @@ class Striker(Node):
                                           # keeper (the robot guard keeps them apart) - j01 yielded the ball
                                           # the robot closer to the ball touches it first, the other one
                                           # steps back (user, 2026-11-26) - in the role game too
-                                          give_way=self._give_way(pose) if self._role() is None else False)
+                                          # (no stepping back for the other robot: going for the ball comes
+                                          # first - user, 2026-11-27; a face-off is handled below)
+                                          give_way=False)
+        # the other robot nearer to the ball and the two close together (user, 2026-11-27): the one farther from
+        # the ball gives way at once - backs off facing the ball, no standing in each other's way
+        if self._role() is None and bf is not None and opp_now is not None:
+            d_me = math.hypot(bf[0] - pose[0], bf[1] - pose[1])
+            d_op = math.hypot(bf[0] - opp_now[0], bf[1] - opp_now[1])
+            d_rr = math.hypot(opp_now[0] - pose[0], opp_now[1] - pose[1])
+            cp = self.cam_priority()
+            other_first = (cp is False) if cp is not None else (d_op < d_me - 0.03)
+            # the robot with the right of way does not get the ball moving within 4 s (i01: stuck at a line for
+            # 6 min while we kept giving way) -> our turn for 4 s
+            ref = getattr(self, 'yield_ref', None)
+            if not other_first or ref is None or math.hypot(bf[0] - ref[0], bf[1] - ref[1]) > 0.03:
+                self.yield_ref = (bf[0], bf[1], now)
+            elif now - ref[2] > 4.0:
+                self.my_turn_until, self.yield_ref = now + 4.0, None
+                self.get_logger().info('the other robot does not move the ball - our turn')
+            if now < getattr(self, 'my_turn_until', 0.0):
+                other_first = False
+            if other_first and min(d_op, getattr(self, 'other_cam', (9.0, 0))[0]) < 0.30 and d_rr < 0.45:
+                # back off to 0.45 m from the other robot, then hold there facing the ball until it has played
+                err = wrap(math.atan2(bf[1] - pose[1], bf[0] - pose[0]) - pose[2])
+                v, w, mode = -0.15, clip(1.5 * err, -1.0, 1.0), 'GIVE_WAY'
+                self.give_way_until = now + 1.5
+            elif now < getattr(self, 'give_way_until', 0.0) and other_first:
+                err = wrap(math.atan2(bf[1] - pose[1], bf[0] - pose[0]) - pose[2])
+                v, w, mode = 0.0, clip(1.5 * err, -1.0, 1.0), 'WAIT'
+        # face-off at the ball in the free game (user, 2026-11-27, 2nd version): both robots at the ball with the
+        # ball between them - too close to judge -> BOTH back off 10 cm straight, then measure the distance to the
+        # ball; the closer one gets ~2 s to touch it, the farther one meanwhile moves to a spot from where it can
+        # push the ball toward its goal.  Same code for both robots (ties decided by the field, not by colour).
+        if self.get_parameter('faceoff').value and self._role() is None and bf is not None and opp_now is not None:
+            fo = getattr(self, 'faceoff', None)
+            vm = (pose[0] - bf[0], pose[1] - bf[1])
+            vo = (opp_now[0] - bf[0], opp_now[1] - bf[1])
+            across = vm[0] * vo[0] + vm[1] * vo[1] < -0.5 * math.hypot(*vm) * math.hypot(*vo)  # ball BETWEEN us
+            if fo is None and now > getattr(self, 'faceoff_quiet', 0.0) and across and \
+                    math.hypot(opp_now[0] - pose[0], opp_now[1] - pose[1]) < 0.34 and \
+                    math.hypot(bf[0] - pose[0], bf[1] - pose[1]) < 0.20 and \
+                    math.hypot(bf[0] - opp_now[0], bf[1] - opp_now[1]) < 0.20:
+                self.faceoff = fo = {'stage': 'back', 'xy': (pose[0], pose[1]), 't0': now}
+                self.get_logger().info('face-off at the ball: both back off 10 cm')
+            if fo is not None and fo['stage'] == 'back':
+                moved = math.hypot(pose[0] - fo['xy'][0], pose[1] - fo['xy'][1])
+                if moved < 0.10 and now - fo['t0'] < 1.5:
+                    v, w, mode = -0.10, 0.0, 'FACEOFF_BACK'      # straight back, both wheels the same
+                else:
+                    d_me = math.hypot(bf[0] - pose[0], bf[1] - pose[1])
+                    d_op = math.hypot(bf[0] - opp_now[0], bf[1] - opp_now[1])
+                    if abs(d_me - d_op) > 0.01:
+                        first = d_me < d_op
+                    else:                                        # a tie: the defender of the nearer goal first
+                        own = -self.goal[0]
+                        first = abs(bf[0] - own) < abs(bf[0] + own) - 0.01
+                    if first:
+                        self.faceoff, fo = None, None
+                        self.faceoff_quiet = now + 2.5
+                        self.get_logger().info('face-off: we are closer - our touch')
+                    else:
+                        u = np.array(aim) - np.array(bf)
+                        u = u / (float(np.linalg.norm(u)) or 1.0)
+                        fo.update(stage='place', t1=now, ball=np.array(bf), u=u)   # the spot is fixed once
+                        self.get_logger().info('face-off: the other robot is closer - taking a pushing spot')
+            if fo is not None and fo['stage'] == 'place':
+                if now - fo['t1'] < 2.0:
+                    # behind the ball toward our goal, 0.30 m off it; round the side if the ball is in the way
+                    u, b0 = fo['u'], fo['ball']
+                    spot = b0 - u * 0.30
+                    me_xy = np.array(pose[:2])
+                    seg = spot - me_xy
+                    k = clip(float(np.dot(np.array(bf) - me_xy, seg) / (float(np.dot(seg, seg)) or 1e-6)), 0.0, 1.0)
+                    if float(np.linalg.norm(me_xy + k * seg - b0)) < 0.22:
+                        nrm = np.array([-u[1], u[0]])
+                        if float(np.dot(me_xy - b0, nrm)) < 0:
+                            nrm = -nrm
+                        spot = b0 + nrm * 0.32                       # first to the side of the ball
+                    face = math.atan2(bf[1] - spot[1], bf[0] - spot[0])
+                    c = self.direct_goto(pose[0], pose[1], pose[2], spot, face, pos_tol=0.04,
+                                         vmax=self.get_parameter('v_approach').value)
+                    v, w, mode = c.linear.x, c.angular.z, 'FACEOFF_PLACE'
+                else:
+                    self.faceoff = None
+                    self.faceoff_quiet = now + 4.0
         # stand-off with the keeper (user, 2026-11-26: yellow brought the ball up to blue and both stood still -
         # blue should push it away): the ball at our nose, the keeper close to it and the ball not moving for
         # 1.5 s -> step back ~18 cm; the ball is then loose and the keeper clears it
-        if self._role() == 'attack' and bf is not None and opp_now is not None:
+        # (not with the wandering keeper: it never takes the ball, stepping back only lost time - u02 11-14 %)
+        if self._role() == 'attack' and bf is not None and opp_now is not None and \
+                ball_play.P['def_style_free'] != 'wander':
             near = math.hypot(bf[0] - pose[0], bf[1] - pose[1]) < 0.20 and \
                 math.hypot(bf[0] - opp_now[0], bf[1] - opp_now[1]) < 0.40
             ref = getattr(self, 'standoff_ref', None)
@@ -666,7 +822,7 @@ class Striker(Node):
             err = wrap(math.atan2(bf[1] - pose[1], bf[0] - pose[0]) - pose[2]) if bf is not None else 0.0
             v, w, mode = -0.08, clip(2.0 * err, -0.8, 0.8), 'STANDOFF_BACK'
         self.rl_pp['mode'] = mode
-        if mode in ('PUSH', 'SHOT', 'SHOT_BACK', 'KICK', 'WINDUP', 'TAP', 'TAP_FLICK', 'TAP_DODGE', 'LINE_TAP', 'LINE_FLICK'):
+        if mode in ('PUSH', 'SHOT', 'SHOT_BACK', 'KICK', 'WINDUP', 'TAP', 'TAP_FLICK', 'TAP_DODGE', 'TAP_STRAIGHT', 'LINE_TAP', 'LINE_FLICK'):
             self.push_t = time.time()
         self.rl_cmd = (v, w)
         self.cancel_nav()
@@ -693,6 +849,14 @@ class Striker(Node):
         else:
             self.guard_since = None
         self.set_state('PLAY_' + self.rl_pp.get('mode', 'BEHIND'))
+        if self.get_parameter('play_debug').value and now - getattr(self, 'dbg_t', 0.0) > 0.2:
+            self.dbg_t = now
+            dball = math.hypot(bf[0] - pose[0], bf[1] - pose[1]) if bf is not None else -1
+            brg = wrap(math.atan2(bf[1] - pose[1], bf[0] - pose[0]) - pose[2]) if bf is not None else 0
+            dop = math.hypot(opp_now[0] - pose[0], opp_now[1] - pose[1]) if opp_now is not None else -1
+            li, lo = getattr(self.cmd_pub, 'last_in', (0, 0)), getattr(self.cmd_pub, 'last_out', (0, 0))
+            self.get_logger().info(f'DBG {mode} d {dball:.2f} brg {brg:+.2f} age {age:.2f} opp {dop:.2f} '
+                                   f'cmd ({v:+.2f},{w:+.2f}) in ({li[0]:+.2f},{li[1]:+.2f}) out ({lo[0]:+.2f},{lo[1]:+.2f})')
         # diagnostics: going to the ball but hardly moving (g14: 11 s ROUND, 15 cm) -> say what holds it back
         ref = getattr(self, 'slow_ref', None)
         py = getattr(self, 'slow_yaw', None)
@@ -731,11 +895,27 @@ class Striker(Node):
         rx, ry, ryaw = pose
         dx, dy = self.opp[0] - rx, self.opp[1] - ry
         c, s = math.cos(ryaw), math.sin(ryaw)
+        if self.cam_priority() is True and cmd.linear.x > 0.0 and self.ball is not None and \
+                math.hypot(self.ball[0] - rx, self.ball[1] - ry) < 0.35:
+            return cmd               # our ball by the cameras (user, 2026-11-27): go and touch it, no holding back
+        # exception (user, 2026-11-27): the ball right in the middle of the camera and nearer than the other
+        # robot -> straight ahead at it, no avoiding, a bump is allowed
+        if self.ball is not None and time.time() - self.ball_t < 0.4 and cmd.linear.x > 0.0 and \
+                abs(cmd.angular.z) < 0.05:
+            bdx, bdy = self.ball[0] - rx, self.ball[1] - ry
+            b_brg = wrap(math.atan2(bdy, bdx) - ryaw)
+            if abs(b_brg) < self.get_parameter('ball_centre_tol').value and \
+                    math.hypot(bdx, bdy) < math.hypot(dx, dy):
+                return cmd
         from pinky_soccer_game.rl_policy import has_priority, robot_guard_vw
         # right of way: the robot closer to the ball (camera ball, lidar opponent) goes first; tie -> yellow
         ball = self.ball if (self.ball is not None and time.time() - self.ball_t < 2.0) else None
         pushing = time.time() - getattr(self, 'push_t', 0.0) < 1.5
-        if ball is None and pushing and getattr(self, 'had_priority', None) is not None:
+        role_now = self._role()
+        fixed = {'regroup_def': True, 'regroup': False}.get(role_now)   # set by the role at once, no 1 s hold
+        if fixed is not None:
+            prio = fixed
+        elif ball is None and pushing and getattr(self, 'had_priority', None) is not None:
             prio = True       # dribbling: the ball under the nose drops out of the camera - still ours (yellow
                               # kept giving way while dribbling, final5g)
         elif ball is None:
@@ -748,7 +928,14 @@ class Striker(Node):
             tie_mine = role == 'attack' or role == 'kickoff' or (role is None and
                                                                  self.get_parameter('team').value == 'yellow')
             own_x = -self.goal[0]
-            if role in ('attack', 'kickoff'):
+            if role is None:
+                prio = True       # free game: going for the ball comes first for both (user, 2026-11-27) - the
+                                  # guard still stops just short of the other robot
+            elif role == 'regroup_def':
+                prio = True       # back to the places after a swap: the defender on its way home goes first ...
+            elif role == 'regroup':
+                prio = False      # ... the new attacker steps aside (u02: both met at full speed, 9 s locked)
+            elif role in ('attack', 'kickoff'):
                 prio = True       # the attacker has the right of way in its attack (p05 C) ...
             elif role == 'defend' and str(self.rl_pp.get('mode', '')).startswith('WANDER'):
                 prio = False      # the wandering keeper always gives way (it is only an obstacle)
@@ -760,7 +947,7 @@ class Striker(Node):
             else:
                 prio = has_priority((rx, ry), self.opp, ball, tie_mine, had=getattr(self, 'had_priority', None))
         had = getattr(self, 'had_priority', None)
-        if had is not None and prio != had and time.time() - getattr(self, 'prio_t', 0.0) < 1.0:
+        if fixed is None and had is not None and prio != had and time.time() - getattr(self, 'prio_t', 0.0) < 1.0:
             prio = had                                   # keep a right-of-way decision at least 1 s
         if prio != had:
             self.had_priority, self.prio_t = prio, time.time()
@@ -827,11 +1014,14 @@ class Striker(Node):
             self.pinch_ref = (now, np.array(ball))
             return v
         still = now - ref[0]
-        if (not prio and still > 2.0) or (still > 5.0 and self.get_parameter('team').value == 'blue'):
+        farther = math.hypot(ball[0] - self.goal[0], ball[1] - self.goal[1]) > \
+            math.hypot(ball[0] + self.goal[0], ball[1] + self.goal[1])      # our target farther than theirs
+        if (not prio and still > 2.0) or (still > 2.0 and farther):          # (same rule for both colours;
+                                                                           # 5 s -> 2 s: dbg7 stalls)
             if getattr(self, 'pinch_log_t', 0.0) < now - 3.0:
                 self.pinch_log_t = now
                 self.get_logger().info('ball squeezed between the robots: backing away')
-            return -0.10 if opp_ahead > 0 else 0.10
+            return -0.15 if opp_ahead > 0 else 0.15
         return v
 
     def _line_guard(self, cmd):
@@ -938,6 +1128,11 @@ class Striker(Node):
         if self.scan is None or self.map is None or pose is None:
             return self.opp if time.time() - self.opp_t < self._opp_hold(pose) else None
         s = self.scan
+        if s is getattr(self, '_opp_scan', None):            # this scan is already in the estimate
+            if self.opp is not None and time.time() - self.opp_t < self._opp_hold(pose):
+                return self.opp
+            return None
+        self._opp_scan = s
         try:    # use the TF of the scan frame: Pinky's rplidar_link is rotated 180 deg w.r.t. base_link
             t = self.tf_buffer.lookup_transform('map', s.header.frame_id, rclpy.time.Time())
         except tf2_ros.TransformException:
@@ -1133,7 +1328,13 @@ class Striker(Node):
                 if cdist < 0.08 or time.time() - self.concede_t0 > 20.0:
                     if self.concede_hold_t is None:
                         self.concede_hold_t = time.time()
-                    if time.time() - self.concede_hold_t < self.get_parameter('concede_hold').value:
+                    # wait at the side until the scorer (reversing home, 2026-11-27) has left our half - our
+                    # start pose lies on its way home (live38: it reversed into us, wheels spun, lost its pose)
+                    opp_c = self.estimate_opponent(pose)
+                    own_sign = -math.copysign(1.0, self.goal[0])
+                    scorer_here = opp_c is not None and opp_c[0] * own_sign > -0.05
+                    if time.time() - self.concede_hold_t < self.get_parameter('concede_hold').value or \
+                            (scorer_here and time.time() - self.concede_hold_t < 20.0):
                         self.cancel_nav()
                         self.stop()
                         self.set_state('CONCEDE_CENTRE')
@@ -1211,11 +1412,23 @@ class Striker(Node):
             elif self._role() is not None:
                 pass        # attack / defence game: the unjam step in _rl_play frees it, the old rule-based
                             # states (ORBIT / BACKOFF) only backed into the line and froze for minutes (g06)
-            elif now_t - ref[3] > self.get_parameter('rl_idle_after').value and now_t >= getattr(self, 'rl_rules_until', 0):
-                self.rl_rules_until = now_t + self.get_parameter('rl_rules_for').value
+            elif now_t - ref[3] > self.get_parameter('rl_idle_after').value and \
+                    now_t >= getattr(self, 'idle_back_until', 0.0) + 1.0:
+                # standing still in play: never just stand (user, 2026-11-27) - back off 10 cm straight and look
+                # again (it used to hand over to the old rule-based state machine, whose DRIBBLE steered while
+                # pushing - the angled touches)
+                self.idle_back_until = now_t + 1.0
                 self.rl_idle_ref = None
-                self.get_logger().info('RL policy idle -> rule-based play for a moment')
-            if now_t >= getattr(self, 'rl_rules_until', 0.0):
+                self.get_logger().info('standing still in play -> back off 10 cm and look again')
+            if now_t < getattr(self, 'idle_back_until', 0.0):
+                self.cancel_nav()
+                cmd = Twist()
+                cmd.linear.x = -0.10
+                self.play_ctx = ((rx, ry, ryaw), self.estimate_opponent((rx, ry, ryaw)), None)
+                self.publish_play(cmd)
+                self.set_state('IDLE_BACK')
+                return
+            if True:
                 self._rl_play((rx, ry, ryaw), now_t)
                 return
             # else: fall through to the rule-based state machine below
