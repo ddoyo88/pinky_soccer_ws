@@ -41,6 +41,7 @@ class PinkyDisplay(Node):
         team = self.get_parameter('team').value
         self.cfg = TEAM[team]
         self.lock = threading.Lock()
+        self.led_srv = None
         self.led = self._open_led()
         self.lcd = self._open_lcd()
         self.images = {k: self._load(self.cfg[k]) for k in ('flag', 'goal')}
@@ -61,7 +62,14 @@ class PinkyDisplay(Node):
                 pass
             return led
         except Exception as e:                                         # noqa: BLE001
-            self.get_logger().warning(f'LED not available: {e}')
+            # the robot driver's led_server (robot.launch.py ensure_led) already owns the strip ("Device or
+            # resource busy"): drive it through its /set_led service instead (2026-11-28)
+            try:
+                from pinky_interfaces.srv import SetLed
+                self.led_srv = (self.create_client(SetLed, 'set_led'), SetLed)
+                self.get_logger().info(f'LED owned by the driver ({e}); using its set_led service')
+            except Exception as e2:                                    # noqa: BLE001
+                self.get_logger().warning(f'LED not available: {e} / {e2}')
             return None
 
     def _open_lcd(self):
@@ -82,6 +90,13 @@ class PinkyDisplay(Node):
             return None
 
     def _led(self, rgb):
+        if self.led is None and self.led_srv is not None:
+            client, SetLed = self.led_srv
+            if client.wait_for_service(timeout_sec=3.0):
+                r, g, b = rgb if rgb is not None else (0, 0, 0)
+                # 'set_pixel' (unlike 'fill') also calls show() in led_server
+                client.call_async(SetLed.Request(command='set_pixel', pixels=list(range(8)), r=r, g=g, b=b))
+            return
         if self.led is None:
             return
         with self.lock:

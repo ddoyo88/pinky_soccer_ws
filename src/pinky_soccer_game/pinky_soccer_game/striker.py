@@ -144,6 +144,10 @@ class Striker(Node):
         P('rl_search_after', 3.0)          # [s] RL mode: ball unseen this long -> the rule-based search (back up,
                                            # turn, roam) until the camera sees it again, then the policy again
         P('line_guard', True)              # never drive over the white boundary line (camera, line/boundary)
+        P('no_lines', False)               # real field (user, 2026-11-28): no lines - the field goes to the outer
+                                           # walls (no line guard, the ball is out only beyond a wall)
+        P('wall_inset', 0.05)              # no_lines: the robots keep this far inside the walls (user: the field =
+                                           # the whole board minus 5 cm, do not wreck the walls)
         P('robot_guard', True)             # (user, 2026-11-27: on again) never drive into the other robot (lidar): slow from 0.32 m centre
                                            # distance, stop at 0.20 m - same rule as the RL training
         P('robot_front', 0.05)             # [m] base_footprint -> bumper front
@@ -155,6 +159,16 @@ class Striker(Node):
         gx = self.get_parameter('goal_x').value
         self.L = L
         self.W = self.get_parameter('field_width').value
+        self.no_lines = self.get_parameter('no_lines').value
+        self.side_strip = self.get_parameter('outer_strip').value
+        self.out_x = L / 2 + 0.01                   # ball beyond this |x| (beside the goal) = out
+        self.guard_L = L / 2                        # map line guard: end lines (goal mouths excepted)
+        if self.no_lines:                           # play to the walls minus wall_inset
+            ins = self.get_parameter('wall_inset').value
+            self.W += 2 * (self.side_strip - ins)
+            self.guard_L = L / 2 + self.side_strip - ins
+            self.out_x = L / 2 + self.side_strip + 0.03
+            self.side_strip = ins
         self.G = self.get_parameter('goal_width').value
         self.goal = np.array([L / 2 if math.isnan(gx) else gx, self.get_parameter('goal_y').value])
         self.attack_yaw = self.get_parameter('attack_yaw').value
@@ -488,7 +502,7 @@ class Striker(Node):
         head = away
         for k in range(7):                                   # turn the escape direction toward the centre
             a = away + wrap(centre - away) * k / 6.0
-            if not over_line_ahead((x, y, a), 0.12, self.L / 2, self.W / 2, self.G) and \
+            if not over_line_ahead((x, y, a), 0.12, self.guard_L, self.W / 2, self.G) and \
                     goal_mouth_guard((x, y, a), 0.12, self.L / 2, self.G) > 0.0:
                 head = a
                 break
@@ -559,7 +573,7 @@ class Striker(Node):
                 cmd.angular.z = clip(2.0 * err, -0.8, 0.8)
                 from pinky_soccer_game.rl_policy import over_line_ahead
                 back = -0.12
-                if over_line_ahead(pose, back, self.L / 2, self.W / 2, self.G) or \
+                if over_line_ahead(pose, back, self.guard_L, self.W / 2, self.G) or \
                         goal_mouth_guard(pose, back, self.L / 2, self.G) == 0.0:
                     # line or a goal behind (keeper in its mouth, r9s2): creep to the remembered spot instead,
                     # a touch moves the ball
@@ -588,7 +602,7 @@ class Striker(Node):
         # ball out of the field (over a line, waiting for the referee's 'ball to centre'): no chasing it into a
         # goal or over the line - stand still facing it (blue kept walking into its own goal for it, final5f)
         b = self.ball
-        if b is not None and (abs(b[0]) > self.L / 2 + 0.01 or abs(b[1]) > self.W / 2 + 0.01) and \
+        if b is not None and (abs(b[0]) > self.out_x or abs(b[1]) > self.W / 2 + 0.01) and \
                 self._role() in ('defend', 'attack'):
             # attack / defence game, ball out: the roles have just swapped - the new defender runs back to its
             # goal at once, the new attacker lines up behind the centre spot for the ball coming back there
@@ -619,7 +633,7 @@ class Striker(Node):
             self.rl_pp['mode'] = 'WAIT'
             self.set_state(tag)
             return
-        if b is not None and (abs(b[0]) > self.L / 2 + 0.01 or abs(b[1]) > self.W / 2 + 0.01):
+        if b is not None and (abs(b[0]) > self.out_x or abs(b[1]) > self.W / 2 + 0.01):
             err = wrap(math.atan2(b[1] - pose[1], b[0] - pose[0]) - pose[2])
             cmd = Twist()
             cmd.angular.z = clip(2.0 * err, -0.8, 0.8) if abs(err) > 0.2 else 0.0
@@ -1033,13 +1047,15 @@ class Striker(Node):
         pose = self.robot_pose()
         if pose is not None and abs(cmd.linear.x) > 1e-3:
             from pinky_soccer_game.rl_policy import over_line_ahead
-            if over_line_ahead(pose, cmd.linear.x, self.L / 2, self.W / 2, self.G):
+            if over_line_ahead(pose, cmd.linear.x, self.guard_L, self.W / 2, self.G):
                 cmd.linear.x = 0.0
                 self.guard_hit = True                        # the RL escape logic counts this too
                 self.line_stops += 1
                 if self.line_stops % 20 == 1:
                     self.get_logger().info('boundary line (map) in the way: stop')
                 return cmd
+        if self.no_lines:                    # no camera line guard: the white lines are not the field edge
+            return cmd
         if time.time() - self.line_t > 1.0 or not len(self.line_pts):
             return cmd
         v = cmd.linear.x
@@ -1087,7 +1103,7 @@ class Striker(Node):
         point-symmetric, a heading reset could flip it) so the lidar pulls it back onto the walls."""
         x, y, yaw = pose
         strip = self.get_parameter('outer_strip').value
-        hx, hy = self.L / 2 + strip - 0.06, self.W / 2 + strip - 0.06
+        hx, hy = self.L / 2 + strip - 0.06, self.W / 2 + self.side_strip - 0.06
         if (abs(x) <= hx + 0.03 and abs(y) <= hy + 0.03) or time.time() - self.reseed_t < 3.0:
             return
         self.reseed_t = time.time()
@@ -1508,7 +1524,7 @@ class Striker(Node):
         self.search_phase = None                      # ball (re)found: the next loss starts a fresh search
 
         self.play_ctx = ((rx, ry, ryaw), opp, (float(b[0]), float(b[1])))
-        if abs(b[0]) > self.L / 2 + 0.04 and abs(b[1]) > self.G / 2:       # 4 cm: camera estimate error
+        if abs(b[0]) > max(self.L / 2 + 0.04, self.out_x) and abs(b[1]) > self.G / 2:       # 4 cm: camera estimate error
             # ball behind a goal line but beside the goal: out of play, cannot be scored -> wait for the
             # referee / a person to put it back instead of circling it next to the wall
             self.cancel_nav()
@@ -1675,7 +1691,7 @@ class Striker(Node):
         d = p - self.goal
         along, side = float(np.dot(d, n)), float(np.dot(d, lat))
         strip = self.get_parameter('outer_strip').value
-        lim = self.W / 2 + strip - 0.095
+        lim = self.W / 2 + self.side_strip - 0.095
         along = min(max(along, -(self.L + strip - 0.095)), -0.045)
         side = min(max(side, -lim), lim)
         return self.goal + n * along + lat * side
@@ -1746,7 +1762,7 @@ class Striker(Node):
         d = p - self.goal
         along, side = float(np.dot(d, n)), float(np.dot(d, lat))
         strip = self.get_parameter('outer_strip').value
-        return -(self.L + strip - 0.09) < along < -0.04 and abs(side) < self.W / 2 + strip - 0.09
+        return -(self.L + strip - 0.09) < along < -0.04 and abs(side) < self.W / 2 + self.side_strip - 0.09
 
     def orbit_point(self, b, u, r):
         """Next point on a circle (orbit_radius) around the ball, ~50 deg further toward the shooting spot

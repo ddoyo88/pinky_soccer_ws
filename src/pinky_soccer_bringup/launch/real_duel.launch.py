@@ -67,7 +67,10 @@ def launch_setup(context):
         striker['policy_path'] = v(f'policy_{team}')       # '' = rule-based striker
         striker.update({'search_w': float(v('search_w')), 'w_max': float(v('turn_max'))})
         striker.update({'team': team, 'goal_x': sign * L / 2, 'attack_yaw': yaw0, 'ready_offset': start,
-                        'use_opponent': v('avoid_opponent').lower() == 'true'})
+                        'use_opponent': v('avoid_opponent').lower() == 'true',
+                        'no_lines': v('no_lines').lower() == 'true',   # play to the outer walls
+                        'orbit_radius': 0.24,                # as in sim_duel (the last sim version)
+                        'play_debug': v('play_debug').lower() == 'true'})
         return GroupAction(scoped=True, actions=[
             *dds, SetEnvironmentVariable('ROS_DOMAIN_ID', str(domain)),
             include('pinky_soccer_nav', 'nav.launch.py',
@@ -77,6 +80,7 @@ def launch_setup(context):
             Node(package='pinky_soccer_vision', executable='ball_detector', name='ball_detector', output='log',
                  parameters=[{'use_sim_time': False, 'backend': 'hsv', 'compressed': True,
                               'process_every_n': 1, 'fallback_hfov_deg': float(v('camera_hfov')),
+                              'range_from_size': v('ball_range') == 'size',   # colour blob size -> range
                               'field_length': L, 'field_width': W, 'goal_width': G,   # boundary line
                               # the URDF says 8 deg down; the real cameras look less down -> correction per
                               # robot (negative = up): camera_calib window result, else cam_pitch_<team>
@@ -92,7 +96,8 @@ def launch_setup(context):
             *dds, SetEnvironmentVariable('ROS_DOMAIN_ID', str(yd)),
             Node(package='pinky_soccer_game', executable='real_referee', name='referee', output='screen',
                  parameters=[{'duel': True, 'field_length': L, 'field_width': W, 'goal_width': G,
-                              'outer_strip': strip, 'win_score': win}]),
+                              'outer_strip': strip, 'win_score': win, 'game_mode': v('game_mode'),
+                              'no_lines': v('no_lines').lower() == 'true'}]),
             Node(package='pinky_soccer_game', executable='match_ui', name='match_ui', output='screen',
                  parameters=[{'win_score': win}]),
         ]),
@@ -132,5 +137,12 @@ def generate_launch_description():
         DeclareLaunchArgument('avoid_opponent', default_value='true'),
         DeclareLaunchArgument('win_score', default_value='0'),   # 0: no 'first to N' - the timed match decides
         DeclareLaunchArgument('sensor_view', default_value='true'),
+        DeclareLaunchArgument('game_mode', default_value='free',
+                              description='free (both attack, yellow kicks off) | attack_defense (old roles)'),
+        DeclareLaunchArgument('play_debug', default_value='false'),
+        DeclareLaunchArgument('no_lines', default_value='true',
+                              description='true: ignore the white lines, the field goes to the outer walls'),
+        DeclareLaunchArgument('ball_range', default_value='size',
+                              description='size: ball range from its apparent size (colour blob) | floor'),
         OpaqueFunction(function=launch_setup),
     ])

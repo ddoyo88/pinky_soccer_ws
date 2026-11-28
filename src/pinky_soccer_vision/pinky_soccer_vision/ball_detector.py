@@ -61,6 +61,10 @@ class BallDetector(Node):
         self.declare_parameter('hsv_s_min', 130)
         self.declare_parameter('hsv_v_min', 80)
         self.declare_parameter('min_area_px', 12)
+        # real robots (user, 2026-11-28: judge the ball by its colour only): the camera sits 6 cm above the floor,
+        # the ball appears near the horizon and the floor-plane range blows up (1 deg pitch error: 0.3 m -> 2.7 m)
+        # -> range from the ball's apparent size (diameter 42.7 mm), bearing from the pixel; no horizon rejection
+        self.declare_parameter('range_from_size', False)
         self.declare_parameter('publish_debug', True)
         self.declare_parameter('compressed', False)
         # extra downward camera pitch on top of /tf.  The real Pinky's robot_description says 0 deg, the
@@ -219,6 +223,7 @@ class BallDetector(Node):
                                    f'cx={intr[2]:.1f} cy={intr[3]:.1f}')
         if self.K is None:
             self._fallback_K(rgb)
+        self.img_hw = rgb.shape[:2]
         if self.get_parameter('detect_lines').value:
             self._lines(rgb, msg.header.frame_id, msg.header.stamp)
         cands = self._detect_yolo(rgb) if self.backend == 'yolo' else self._detect_hsv(rgb)
@@ -268,12 +273,29 @@ class BallDetector(Node):
             return False
         o, d = rays[0], rays[1][0]
         plane_z = self.ball_r - self.base_h              # ball-centre height in the base frame
-        if d[2] >= -1e-4:
-            return False
-        s = (plane_z - o[2]) / d[2]
-        if s <= 0:
-            return False
-        p = o + s * d
+        p = None
+        if self.get_parameter('range_from_size').value and det[2] > 2.0:
+            h, w = getattr(self, 'img_hw', (480, 640))
+            r_px = det[2] / 2
+            clipped = det[0] - r_px < 2 or det[0] + r_px > w - 2 or det[1] + r_px > h - 2
+            slant = self.K[0] * 2 * self.ball_r / det[2]           # camera -> ball centre
+            hd = math.hypot(d[0], d[1])
+            if hd > 1e-6:
+                g = math.sqrt(max(slant ** 2 - (o[2] - plane_z) ** 2, 0.0))
+                p = np.array([o[0] + g * d[0] / hd, o[1] + g * d[1] / hd, plane_z])
+            if clipped and d[2] < -1e-4:                           # cut by the image edge: the size is too small
+                s = (plane_z - o[2]) / d[2]                        # -> the floor plane (close, below: reliable)
+                if s > 0:
+                    p = o + s * d
+            if p is None:
+                return False
+        else:
+            if d[2] >= -1e-4:
+                return False
+            s = (plane_z - o[2]) / d[2]
+            if s <= 0:
+                return False
+            p = o + s * d
         if math.hypot(p[0], p[1]) > self.get_parameter('max_range').value:
             return False
 
